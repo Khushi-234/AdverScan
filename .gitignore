@@ -28,6 +28,7 @@ wheels/
 venv/
 .venv/
 env/
+.env
 .env/
 env.bak/
 venv.bak/
