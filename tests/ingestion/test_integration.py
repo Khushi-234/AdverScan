@@ -107,3 +107,20 @@ def test_app_model_ingestion_alias_integration():
 
     assert isinstance(adapter, PyTorchAdapter)
     assert isinstance(metadata, ModelMetadata)
+
+
+def test_direct_pipeline_import_integration():
+    """Test importing ingest_model directly from app.ingestion.pipeline."""
+    from app.ingestion.pipeline import ingest_model as direct_ingest_model
+
+    model = EndToEndModel()
+    sample_input = torch.randn(1, 16)
+
+    adapter, metadata = direct_ingest_model(
+        model_path=model,
+        sample_input=sample_input,
+        device="cpu"
+    )
+
+    assert isinstance(adapter, PyTorchAdapter)
+    assert isinstance(metadata, ModelMetadata)
