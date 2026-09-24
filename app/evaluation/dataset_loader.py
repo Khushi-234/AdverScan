@@ -132,3 +132,4 @@ class GTSRBDatasetLoader(BaseDatasetLoader):
             targets_tensor = torch.tensor(targets, dtype=torch.long)
 
             yield pixel_values, targets_tensor, targets
+
