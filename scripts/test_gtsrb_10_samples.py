@@ -69,6 +69,8 @@ def main():
     model_name = "bazyl/gtsrb-model"
     dataset_name = "bazyl/GTSRB"
     num_classes = 43
+    num_samples_target = args.samples
+    split_str = f"test[:{num_samples_target}]" if num_samples_target > 0 else "test"
 
     # Device selection
     if args.device:
@@ -80,7 +82,7 @@ def main():
     print("AdverScan — Generalized GTSRB Baseline & Multi-Attack Evaluation")
     print("=" * 70)
     print(f"Target Device:             {device}")
-    print(f"Dataset Split:             {dataset_name} (test[:{args.samples}])")
+    print(f"Dataset Split:             {dataset_name} ({split_str})")
     print(f"Target Attack(s):          {args.attack.upper()}")
     print(f"Epsilon Budget:            {args.epsilon:.5f}")
     print(f"Samples Count:             {args.samples}")
