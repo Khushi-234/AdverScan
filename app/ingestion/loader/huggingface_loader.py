@@ -173,7 +173,7 @@ class HuggingFaceLoader(BaseModelLoader):
                         last_exc = e2
                         # Fallback for gliner2 AutoExtractor
                         try:
-                            from gliner2 import AutoExtractor
+                            from gliner2 import AutoExtractor  # type: ignore[import-not-found,import]
                             extractor = AutoExtractor.from_pretrained(model_id, **kwargs)
                             model = getattr(extractor, "encoder", getattr(extractor, "model", extractor))
                         except Exception as e3:
