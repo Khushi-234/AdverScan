@@ -1,8 +1,8 @@
 """
-SHAP-based XAI technique implementation for AdverScan.
+SHAP-based XAI technique implementations for AdverScan.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 import numpy as np
 
 try:
@@ -12,12 +12,27 @@ except ImportError:
     shap = None
     _SHAP_AVAILABLE = False
 
+from app.explainability.utils import predict_proba_np, to_numpy, to_tensor, unwrap_model
+from app.explainability.modality import Modality
+from app.explainability.techniques.base import BaseExplainer
+from app.explainability.techniques.tree_shap_explainer import TreeSHAPExplainer
 
-class SHAPExplainer:
+__all__ = ["SHAPExplainer", "TreeSHAPExplainer"]
+
+
+class SHAPExplainer(BaseExplainer):
     """
-    SHAP-based feature/image attribution explainer.
-    Gracefully handles optional availability of the `shap` package.
+    SHAP-based feature/image/tabular attribution explainer.
+    Gracefully handles optional availability of the `shap` package and diverse modalities.
     """
+
+    name: str = "shap"
+    supported_modalities: List[Modality] = [
+        Modality.TABULAR,
+        Modality.IMAGE,
+        Modality.TIMESERIES,
+        Modality.TEXT,
+    ]
 
     def __init__(self, **kwargs: Any):
         """Initialize SHAPExplainer."""
@@ -89,16 +104,20 @@ class SHAPExplainer:
         inputs: Any,
         target_class: Optional[int] = None,
         background_inputs: Optional[Any] = None,
+        output_mode: str = "auto",
+        modality: Optional[Union[str, Modality]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         Generate SHAP attribution for model predictions on inputs.
 
         Args:
-            model: PyTorch model or prediction function.
-            inputs: Input tensor or numpy array.
+            model: PyTorch model, scikit-learn estimator, or prediction function.
+            inputs: Input tensor, numpy array, or strings.
             target_class: Target class index to explain (optional).
-            background_inputs: Background dataset samples for SHAP background reference (optional).
+            background_inputs: Background dataset samples for SHAP baseline reference (optional).
+            output_mode: 'classification', 'regression', 'anomaly_score', or 'auto'.
+            modality: Explicit modality hint.
 
         Returns:
             Structured attribution dictionary indicating execution status and result.
@@ -113,104 +132,159 @@ class SHAPExplainer:
             }
 
         try:
-            import torch
-            import torch.nn.functional as F
+            batch_size = int(kwargs.get("batch_size", 64))
+            max_evals = int(kwargs.get("shap_max_evals", kwargs.get("max_evals", 100)))
+            max_text_length = kwargs.get("max_text_length", 128)
+            tokenizer = kwargs.get("tokenizer", getattr(model, "tokenizer", None))
 
-            # Convert inputs to numpy if tensor
-            if isinstance(inputs, torch.Tensor):
-                inputs_np = inputs.detach().cpu().numpy()
+            # 1. Text input handling
+            if (modality == Modality.TEXT) or (isinstance(inputs, (list, tuple, str)) and (isinstance(inputs, str) or (inputs and isinstance(inputs[0], str)))):
+                text_list = [inputs] if isinstance(inputs, str) else list(inputs)
+
+                def text_predict_fn(texts: List[str]) -> np.ndarray:
+                    return predict_proba_np(
+                        model,
+                        texts,
+                        output_mode=output_mode,
+                        batch_size=batch_size,
+                        max_text_length=max_text_length,
+                        tokenizer=tokenizer,
+                    )
+
+                explainer = shap.Explainer(text_predict_fn)
+                try:
+                    shap_values = explainer(text_list, max_evals=max_evals)
+                except Exception:
+                    shap_values = explainer(text_list)
+                values = shap_values.values if hasattr(shap_values, "values") else np.asarray(shap_values)
+
+                return {
+                    "status": "success",
+                    "executed": True,
+                    "technique": "shap",
+                    "message": "SHAP text explanation computed successfully.",
+                    "attribution": values.tolist() if isinstance(values, np.ndarray) else values,
+                }
+
+            # 2. Tensor / array inputs (tabular, image, timeseries)
+            inputs_np = to_numpy(inputs)
+            if inputs_np.ndim == 1:
+                inputs_np = inputs_np.reshape(1, -1)
+
+            # Universal prediction function wrapper utilizing predict_proba_np
+            def predict_fn(x: np.ndarray) -> np.ndarray:
+                return predict_proba_np(model, x, output_mode=output_mode, batch_size=batch_size)
+
+            # Prepare background dataset respecting baseline_strategy
+            baseline_strategy = kwargs.get("baseline_strategy", "mean")
+            if background_inputs is not None:
+                bg_np = to_numpy(background_inputs)
+                if len(bg_np) > 100:
+                    bg_np = bg_np[:100]
+                if baseline_strategy == "mean" and len(bg_np) > 1:
+                    bg_np = np.mean(bg_np, axis=0, keepdims=True)
             else:
-                inputs_np = np.asarray(inputs)
+                bg_np = np.zeros_like(inputs_np)
 
-            orig_shape = inputs_np.shape
-            B = orig_shape[0]
+            # For 3D or 4D data (timeseries or images), handle flattening for black-box or GradientExplainer for torch
+            is_multidim = inputs_np.ndim > 2
+            unwrapped = unwrap_model(model)
+            use_grad_explainer = (
+                is_multidim
+                and hasattr(shap, "GradientExplainer")
+                and hasattr(unwrapped, "parameters")
+                and callable(getattr(unwrapped, "parameters", None))
+            )
 
-            # Strict upper bounds for computational safety
-            user_nsamples = kwargs.get("nsamples", 8)
-            nsamples = min(user_nsamples, 20)
+            values = None
+            orig_shape = None
 
-            if inputs_np.ndim == 4:
-                # 4D Image inputs: (B, C, H, W)
-                _, C, H, W = orig_shape
-                user_grid = kwargs.get("grid_size", 4)
-                grid_size = min(max(user_grid, 2), 8)  # Default 4x4 (16 features), max 8x8 (64 features)
-                gh = min(H, grid_size)
-                gw = min(W, grid_size)
-                num_patches = gh * gw
+            if use_grad_explainer:
+                try:
+                    import torch
+                    import torch.nn as nn
+                    if isinstance(unwrapped, nn.Module):
+                        device = next(unwrapped.parameters()).device if list(unwrapped.parameters()) else torch.device("cpu")
+                        bg_tensor = to_tensor(bg_np, device=device)
+                        inp_tensor = to_tensor(inputs_np, device=device)
+                        explainer = shap.GradientExplainer(unwrapped, bg_tensor)
+                        shap_vals = explainer.shap_values(inp_tensor)
 
-                flat_inputs = np.ones((B, num_patches), dtype=np.float32)
-                flat_bg = np.zeros((1, num_patches), dtype=np.float32)
+                        if isinstance(shap_vals, list):
+                            orig_shape = [tuple(v.shape) for v in shap_vals]
+                            idx = target_class if (target_class is not None and 0 <= target_class < len(shap_vals)) else 0
+                            values = shap_vals[idx]
+                        else:
+                            values = to_numpy(shap_vals)
+                            orig_shape = tuple(values.shape)
+                            if values.ndim == inputs_np.ndim + 1 and target_class is not None:
+                                c_idx = target_class if target_class < values.shape[-1] else 0
+                                values = values[..., c_idx]
+                except Exception:
+                    values = None
 
-                t_orig = torch.from_numpy(inputs_np).float()
-                # Compute channel-wise mean background reference image: (B, C, 1, 1)
-                t_bg = t_orig.mean(dim=(-2, -1), keepdim=True)
+            if values is None:
+                if is_multidim:
+                    # Flatten to 2D with a reshaping predict_fn
+                    flat_inputs = inputs_np.reshape(inputs_np.shape[0], -1)
+                    flat_bg = bg_np.reshape(bg_np.shape[0], -1)
+                    input_shape = inputs_np.shape
 
-                def predict_fn(x_patches: np.ndarray) -> np.ndarray:
-                    N = x_patches.shape[0]
-                    # Reshape patch perturbations (N, num_patches) -> (N, 1, gh, gw)
-                    p_tensor = torch.from_numpy(x_patches).float().view(N, 1, gh, gw)
-                    # Upsample patch mask to (N, 1, H, W)
-                    mask = F.interpolate(p_tensor, size=(H, W), mode="nearest")
-                    # Broadcast mask over batch items safely for any sample count N
-                    repeats = (N + B - 1) // B
-                    t_expanded = t_orig.repeat(repeats, 1, 1, 1)[:N]
-                    t_bg_expanded = t_bg.repeat(repeats, 1, 1, 1)[:N]
-                    # Blend original image with channel-wise mean background reference
-                    t_in = t_expanded * mask + t_bg_expanded * (1.0 - mask)
-                    return self._eval_model(model, t_in)
+                    def flat_predict_fn(x_flat: np.ndarray) -> np.ndarray:
+                        x_reshaped = x_flat.reshape((-1,) + input_shape[1:])
+                        return predict_fn(x_reshaped)
 
-                explainer = shap.KernelExplainer(predict_fn, flat_bg)
-                shap_values = explainer.shap_values(flat_inputs, nsamples=nsamples)
+                    explainer = shap.Explainer(flat_predict_fn, flat_bg)
+                    try:
+                        shap_values = explainer(flat_inputs, max_evals=max_evals)
+                    except Exception:
+                        shap_values = explainer(flat_inputs)
+                    raw_vals = shap_values.values if hasattr(shap_values, "values") else np.asarray(shap_values)
 
-                attr_patch = self._extract_target_attribution(shap_values, target_class, batch_size=B)
-                # Reshape patch attributions back to spatial dimensions (B, C, H, W)
-                attr_patch_t = torch.from_numpy(attr_patch).float().view(-1, 1, gh, gw)
-                attr_full_t = F.interpolate(attr_patch_t, size=(H, W), mode="nearest")
-                attr_full_t = attr_full_t.repeat(1, C, 1, 1)
-                attr_final = attr_full_t.numpy()
-
-            else:
-                # 1D/2D tabular or vector inputs: (B, F)
-                if inputs_np.ndim > 2:
-                    flat_inputs = inputs_np.reshape(B, -1)
+                    # Reshape back to input dimensions
+                    if isinstance(raw_vals, np.ndarray):
+                        if raw_vals.ndim == 2:  # (N, D_flat)
+                            values = raw_vals.reshape(input_shape)
+                            orig_shape = tuple(values.shape)
+                        elif raw_vals.ndim == 3:  # (N, D_flat, C)
+                            c_dim = raw_vals.shape[-1]
+                            reshaped = raw_vals.reshape(input_shape + (c_dim,))
+                            orig_shape = tuple(reshaped.shape)
+                            if target_class is not None:
+                                c_idx = target_class if target_class < c_dim else 0
+                                values = reshaped[..., c_idx]
+                            else:
+                                values = reshaped[..., 0]
+                        else:
+                            values = raw_vals
+                            orig_shape = tuple(values.shape)
                 else:
-                    flat_inputs = inputs_np
+                    # Tabular 2D data
+                    explainer = shap.Explainer(predict_fn, bg_np)
+                    try:
+                        shap_values = explainer(inputs_np, max_evals=max_evals)
+                    except Exception:
+                        shap_values = explainer(inputs_np)
+                    values = shap_values.values if hasattr(shap_values, "values") else np.asarray(shap_values)
 
-                feature_dim = flat_inputs.shape[1]
-
-                if background_inputs is not None:
-                    if isinstance(background_inputs, torch.Tensor):
-                        bg_np = background_inputs.detach().cpu().numpy()
-                    else:
-                        bg_np = np.asarray(background_inputs)
-                    flat_bg = bg_np.reshape(len(bg_np), -1)
-                else:
-                    if flat_inputs.shape[0] > 1:
-                        flat_bg = np.mean(flat_inputs, axis=0, keepdims=True)
-                    else:
-                        flat_bg = np.zeros_like(flat_inputs)
-
-                def predict_fn(x: np.ndarray) -> np.ndarray:
-                    x_nd = x.reshape((-1,) + orig_shape[1:])
-                    t_input = torch.tensor(x_nd, dtype=torch.float32)
-                    return self._eval_model(model, t_input)
-
-                explainer = shap.KernelExplainer(predict_fn, flat_bg)
-                shap_values = explainer.shap_values(flat_inputs, nsamples=nsamples)
-
-
-                attr_raw = self._extract_target_attribution(shap_values, target_class, batch_size=B)
-                if attr_raw.ndim == 2:
-                    attr_final = attr_raw.reshape((B,) + orig_shape[1:])
-                else:
-                    attr_final = attr_raw
+                    if isinstance(values, list):
+                        orig_shape = [tuple(v.shape) for v in values]
+                        idx = target_class if (target_class is not None and 0 <= target_class < len(values)) else 0
+                        values = values[idx]
+                    elif isinstance(values, np.ndarray):
+                        orig_shape = tuple(values.shape)
+                        # Slice ONLY when values.ndim == inputs_np.ndim + 1
+                        if values.ndim == inputs_np.ndim + 1 and target_class is not None:
+                            c_idx = target_class if target_class < values.shape[-1] else 0
+                            values = values[..., c_idx]
 
             return {
                 "status": "success",
                 "executed": True,
                 "technique": "shap",
                 "message": "SHAP explanation computed successfully.",
-                "attribution": attr_final.tolist() if isinstance(attr_final, np.ndarray) else attr_final,
+                "attribution": values.tolist() if isinstance(values, np.ndarray) else values,
+                "unsliced_shape": orig_shape,
             }
         except Exception as e:
             return {
