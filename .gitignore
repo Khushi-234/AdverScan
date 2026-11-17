@@ -37,6 +37,7 @@ venv.bak/
 *.log
 logs/
 mlruns/
+data/
 
 # Datasets and model checkpoints (large files)
 datasets/*
