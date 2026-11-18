@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .execution_summary import ExecutionSummary
+from .execution_summary import ExecutionSummary, ModuleExecutionRecord
 
 
 @dataclass
@@ -26,7 +26,7 @@ class ReportData:
     - M6  : XAI Findings (feature attribution, attack impact, failure analysis)
     - M7  : Hardening (selected defense, applied defense, hardened model)
     - M8  : Re-Test Results + Before vs After Comparison
-    - M9  : Execution Performance (from ResultTracker / ExecutionSummary)
+    - M9  : Execution Performance (from OrchestrationResult / ExecutionSummary)
     """
 
     # ── M1: Model Information ─────────────────────────────────────────────────
@@ -187,6 +187,25 @@ class ReportData:
 
         # Build execution summary
         exec_summary = ExecutionSummary.from_orchestration_result(orch_dict)
+        if retest_dict and exec_summary is not None:
+            has_retest = any(
+                "retest" in str(r.module_id).lower() or "m8" in str(r.module_id).lower()
+                for r in exec_summary.modules
+            )
+            if not has_retest:
+                retest_time = float(retest_dict.get("execution_time_seconds", 0.0))
+                exec_summary.modules.append(
+                    ModuleExecutionRecord(
+                        module_id="M8_retest",
+                        module_name="M8 RETEST & VALIDATION",
+                        status=str(retest_dict.get("status", "SUCCESS")).upper(),
+                        elapsed_seconds=retest_time,
+                        metrics={
+                            "overall_status": retest_dict.get("overall_status", "accepted"),
+                            "overall_improved": retest_dict.get("overall_improved", True),
+                        },
+                    )
+                )
 
         return cls(
             model_info=orch_dict.get("model_metadata") or {},
@@ -206,5 +225,8 @@ class ReportData:
                 "execution_mode": orch_dict.get("execution_mode"),
                 "timestamp": orch_dict.get("timestamp"),
                 "execution_time_seconds": orch_dict.get("execution_time_seconds"),
+                "resource_summary": orch_dict.get("resource_summary"),
+                "failure_records": orch_dict.get("failure_records"),
             },
         )
+
