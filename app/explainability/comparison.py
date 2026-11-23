@@ -3,7 +3,7 @@ Clean vs adversarial model behavior and attribution comparison for explainabilit
 Supports image, text, tabular, and time-series modalities.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 import numpy as np
 
 try:
@@ -65,6 +65,8 @@ def compare_attributions(
             "attribution_l1": None,
             "attribution_l2": None,
             "normalized_attribution_l1": None,
+            "attribution_drift": None,
+            "feature_salience_distortion": None,
             "attribution_cosine_similarity": None,
             "attribution_spearman_correlation": None,
             "attribution_mean_difference": None,
@@ -81,9 +83,36 @@ def compare_attributions(
                 "attribution_l1": None,
                 "attribution_l2": None,
                 "normalized_attribution_l1": None,
+                "attribution_drift": None,
+                "feature_salience_distortion": None,
                 "attribution_cosine_similarity": None,
                 "attribution_spearman_correlation": None,
                 "attribution_mean_difference": None,
+<<<<<<< ours
+=======
+                "signed_attribution_mean_shift": None,
+                "clean_importance_norm": None,
+                "adversarial_importance_norm": None,
+                "top_feature_overlap": None,
+                "attribution_validity": {"status": "unavailable"},
+            }
+
+        # Check for empty attributions
+        if clean_arr.size == 0 or adv_arr.size == 0:
+            return {
+                "attribution_comparison_status": "empty_attribution",
+                "attribution_l1": None,
+                "attribution_l2": None,
+                "normalized_attribution_l1": None,
+                "attribution_drift": None,
+                "feature_salience_distortion": None,
+                "attribution_cosine_similarity": None,
+                "attribution_spearman_correlation": None,
+                "attribution_mean_difference": None,
+                "signed_attribution_mean_shift": None,
+                "clean_importance_norm": 0.0,
+                "adversarial_importance_norm": 0.0,
+>>>>>>> theirs
                 "top_feature_overlap": None,
             }
 
@@ -93,12 +122,52 @@ def compare_attributions(
                 "attribution_l1": None,
                 "attribution_l2": None,
                 "normalized_attribution_l1": None,
+                "attribution_drift": None,
+                "feature_salience_distortion": None,
                 "attribution_cosine_similarity": None,
                 "attribution_spearman_correlation": None,
                 "attribution_mean_difference": None,
                 "top_feature_overlap": None,
             }
 
+<<<<<<< ours
+=======
+        # Safe alignment for 1D shape mismatches (e.g. differing text token lengths)
+        comparison_status = "success"
+        if clean_arr.shape != adv_arr.shape:
+            if clean_arr.ndim == 1 and adv_arr.ndim == 1:
+                max_len = max(len(clean_arr), len(adv_arr))
+                clean_arr = np.pad(clean_arr, (0, max_len - len(clean_arr)), mode="constant")
+                adv_arr = np.pad(adv_arr, (0, max_len - len(adv_arr)), mode="constant")
+                comparison_status = "aligned_with_padding"
+            else:
+                return {
+                    "attribution_comparison_status": "shape_mismatch",
+                    "attribution_l1": None,
+                    "attribution_l2": None,
+                    "normalized_attribution_l1": None,
+                    "attribution_drift": None,
+                    "feature_salience_distortion": None,
+                    "attribution_cosine_similarity": None,
+                    "attribution_spearman_correlation": None,
+                    "attribution_mean_difference": None,
+                    "signed_attribution_mean_shift": None,
+                    "clean_importance_norm": float(np.linalg.norm(clean_arr.ravel())),
+                    "adversarial_importance_norm": float(np.linalg.norm(adv_arr.ravel())),
+                    "top_feature_overlap": None,
+                    "attribution_validity": {"status": "shape_mismatch"},
+                }
+
+        clean_flat = clean_arr.flatten()
+        adv_flat = adv_arr.flatten()
+
+        clean_norm = float(np.linalg.norm(clean_flat))
+        adv_norm = float(np.linalg.norm(adv_flat))
+
+        clean_is_near_zero = bool(clean_norm < 1e-12)
+        adv_is_near_zero = bool(adv_norm < 1e-12)
+
+>>>>>>> theirs
         diff = clean_arr - adv_arr
         l1_diff = float(np.mean(np.abs(diff)))
         l2_diff = float(np.linalg.norm(diff))
@@ -114,17 +183,31 @@ def compare_attributions(
         if clean_sum > 1e-12 and adv_sum > 1e-12:
             clean_normed = clean_flat / clean_sum
             adv_normed = adv_flat / adv_sum
-            norm_l1 = float(np.sum(np.abs(clean_normed - adv_normed)))
-        else:
+            norm_l1 = float(np.clip(np.sum(np.abs(clean_normed - adv_normed)), 0.0, 2.0))
+        elif clean_sum <= 1e-12 and adv_sum <= 1e-12:
             norm_l1 = 0.0
+        else:
+            # One vector is zero and the other has non-zero normalized attribution mass
+            norm_l1 = 1.0
 
+<<<<<<< ours
         norm_clean = np.linalg.norm(clean_flat)
         norm_adv = np.linalg.norm(adv_flat)
 
         if norm_clean > 1e-12 and norm_adv > 1e-12:
             cosine_sim = float(np.dot(clean_flat, adv_flat) / (norm_clean * norm_adv))
+=======
+        if clean_norm > 1e-12 and adv_norm > 1e-12:
+            cosine_sim = float(np.clip(np.dot(clean_flat, adv_flat) / (clean_norm * adv_norm), -1.0, 1.0))
+>>>>>>> theirs
         else:
             cosine_sim = 1.0 if (norm_clean <= 1e-12 and norm_adv <= 1e-12) else 0.0
+
+        feature_salience_distortion = (
+            float(np.clip(1.0 - cosine_sim, 0.0, 2.0))
+            if (cosine_sim is not None and np.isfinite(cosine_sim))
+            else None
+        )
 
         # Spearman rank correlation
         if _SCIPY_AVAILABLE and spearmanr is not None:
@@ -159,6 +242,8 @@ def compare_attributions(
             "attribution_l1": l1_diff,
             "attribution_l2": l2_diff,
             "normalized_attribution_l1": norm_l1,
+            "attribution_drift": norm_l1,
+            "feature_salience_distortion": feature_salience_distortion,
             "attribution_cosine_similarity": cosine_sim,
             "attribution_spearman_correlation": spearman_corr,
             "attribution_mean_difference": mean_diff,
@@ -170,6 +255,8 @@ def compare_attributions(
             "attribution_l1": None,
             "attribution_l2": None,
             "normalized_attribution_l1": None,
+            "attribution_drift": None,
+            "feature_salience_distortion": None,
             "attribution_cosine_similarity": None,
             "attribution_spearman_correlation": None,
             "attribution_mean_difference": None,
@@ -180,8 +267,8 @@ def compare_attributions(
 def compare_explanations(
     clean_prediction: Any,
     adversarial_prediction: Any,
-    clean_confidence: float,
-    adversarial_confidence: float,
+    clean_confidence: Optional[Union[float, np.floating[Any]]] = None,
+    adversarial_confidence: Optional[Union[float, np.floating[Any]]] = None,
     clean_attribution: Optional[Any] = None,
     adv_attribution: Optional[Any] = None,
     clean_top_features: Optional[List[Dict[str, Any]]] = None,
@@ -209,8 +296,15 @@ def compare_explanations(
     Returns:
         Structured comparison dictionary.
     """
-    prediction_changed = bool(clean_prediction != adversarial_prediction)
-    confidence_difference = float(clean_confidence - adversarial_confidence)
+    if clean_prediction is not None and adversarial_prediction is not None:
+        prediction_changed = bool(clean_prediction != adversarial_prediction)
+    else:
+        prediction_changed = None
+
+    if clean_confidence is not None and adversarial_confidence is not None:
+        confidence_difference = float(clean_confidence - adversarial_confidence)
+    else:
+        confidence_difference = None
 
     # Compute clean_class_confidence_drop: p(clean_class|clean) - p(clean_class|adv)
     clean_class_confidence_drop = None
@@ -243,20 +337,57 @@ def compare_explanations(
         adv_top_features=adv_top_features,
     )
 
+<<<<<<< ours
     result = {
         "clean_prediction": clean_prediction,
         "adversarial_prediction": adversarial_prediction,
         "clean_confidence": float(clean_confidence),
         "adversarial_confidence": float(adversarial_confidence),
+=======
+    attack_obj = "targeted" if target_class is not None else "untargeted"
+    if target_class is not None:
+        attack_success = bool(adversarial_prediction == target_class) if adversarial_prediction is not None else None
+    else:
+        attack_success = prediction_changed
+
+    prediction_analysis = {
+        "clean_prediction": _to_clean_value(clean_prediction),
+        "adversarial_prediction": _to_clean_value(adversarial_prediction),
+        "clean_confidence": float(clean_confidence) if clean_confidence is not None else None,
+        "adversarial_confidence": float(adversarial_confidence) if adversarial_confidence is not None else None,
+        "prediction_changed": prediction_changed,
+        "prediction_consistency": (not prediction_changed) if prediction_changed is not None else None,
+        "confidence_difference": confidence_difference,
+        "clean_class_confidence_drop": clean_class_confidence_drop,
+        "logit_margin": logit_margin,
+        "clean_probabilities": _to_clean_value(clean_probs),
+        "adversarial_probabilities": _to_clean_value(adv_probs),
+        "target_class": _to_clean_value(target_class),
+        "attack_objective": attack_obj,
+        "attack_success": attack_success,
+    }
+
+    result = {
+        "clean_prediction": _to_clean_value(clean_prediction),
+        "adversarial_prediction": _to_clean_value(adversarial_prediction),
+        "clean_confidence": float(clean_confidence) if clean_confidence is not None else None,
+        "adversarial_confidence": float(adversarial_confidence) if adversarial_confidence is not None else None,
+>>>>>>> theirs
         "prediction_changed": prediction_changed,
         "confidence_difference": confidence_difference,
         "clean_class_confidence_drop": clean_class_confidence_drop,
         "logit_margin": logit_margin,
+<<<<<<< ours
+=======
+        "prediction_analysis": prediction_analysis,
+        "attribution_drift": attr_comp.get("attribution_drift"),
+        "feature_salience_distortion": attr_comp.get("feature_salience_distortion"),
+>>>>>>> theirs
     }
 
     if target_class is not None:
         result["target_class"] = target_class
-        result["targeted_attack_success"] = bool(adversarial_prediction == target_class)
+        result["targeted_attack_success"] = bool(adversarial_prediction == target_class) if adversarial_prediction is not None else None
 
     result.update(attr_comp)
     return result

@@ -185,6 +185,51 @@ class SHAPExplainer(BaseExplainer):
             else:
                 bg_np = np.zeros_like(inputs_np)
 
+<<<<<<< ours
+=======
+            # Helper for 4D image patch/grid KernelExplainer
+            def _explain_image_patches(img_arr: np.ndarray) -> np.ndarray:
+                img_shape: Any = img_arr.shape
+                B, C, H, W = int(img_shape[0]), int(img_shape[1]), int(img_shape[2]), int(img_shape[3])
+                grid_size = kwargs.get("grid_size", 4)
+                gh = min(grid_size, H)
+                gw = min(grid_size, W)
+
+                import torch
+                import torch.nn.functional as F
+                t_in = torch.from_numpy(img_arr).float()
+                t_pooled = F.adaptive_avg_pool2d(t_in.mean(dim=1, keepdim=True), (gh, gw))
+                flat_inputs = t_pooled.view(B, -1).numpy()
+                flat_bg = np.zeros_like(flat_inputs)
+
+                def patch_predict_fn(x_flat: np.ndarray) -> np.ndarray:
+                    x_t = torch.from_numpy(x_flat).float().view(-1, 1, gh, gw)
+                    x_up = F.interpolate(x_t, size=(H, W), mode="nearest")
+                    x_up = x_up.repeat(1, C, 1, 1)
+                    return self._eval_model(model, x_up)
+
+                nsamples = kwargs.get("nsamples", 10)
+                explainer = shap.KernelExplainer(patch_predict_fn, flat_bg)
+                shap_values = explainer.shap_values(flat_inputs, nsamples=nsamples)
+
+                attr_patch = self._extract_target_attribution(shap_values, target_class, batch_size=B)
+                attr_patch_t = torch.from_numpy(attr_patch).float().view(-1, 1, gh, gw)
+                attr_full_t = F.interpolate(attr_patch_t, size=(H, W), mode="nearest")
+                attr_full_t = attr_full_t.repeat(1, C, 1, 1)
+                return attr_full_t.numpy()
+
+            if inputs_np.ndim == 4 and "grid_size" in kwargs:
+                attr_final = _explain_image_patches(inputs_np)
+                return {
+                    "status": "success",
+                    "executed": True,
+                    "technique": "shap",
+                    "message": "SHAP explanation computed successfully.",
+                    "attribution": attr_final.tolist() if isinstance(attr_final, np.ndarray) else attr_final,
+                    "unsliced_shape": tuple(attr_final.shape),
+                }
+
+>>>>>>> theirs
             # For 3D or 4D data (timeseries or images), handle flattening for black-box or GradientExplainer for torch
             is_multidim = inputs_np.ndim > 2
             unwrapped = unwrap_model(model)
@@ -216,14 +261,25 @@ class SHAPExplainer(BaseExplainer):
                         else:
                             values = to_numpy(shap_vals)
                             orig_shape = tuple(values.shape)
-                            if values.ndim == inputs_np.ndim + 1 and target_class is not None:
-                                c_idx = target_class if target_class < values.shape[-1] else 0
+                            if values.ndim == inputs_np.ndim + 1:
+                                c_idx = (target_class if target_class < values.shape[-1] else 0) if target_class is not None else 0
                                 values = values[..., c_idx]
                 except Exception:
                     values = None
 
             if values is None:
-                if is_multidim:
+                if inputs_np.ndim == 4:
+                    # For 4D images when GradientExplainer is unavailable or failed, use spatial patch aggregation
+                    attr_final = _explain_image_patches(inputs_np)
+                    return {
+                        "status": "success",
+                        "executed": True,
+                        "technique": "shap",
+                        "message": "SHAP explanation computed successfully.",
+                        "attribution": attr_final.tolist() if isinstance(attr_final, np.ndarray) else attr_final,
+                        "unsliced_shape": tuple(attr_final.shape),
+                    }
+                elif is_multidim:
                     # Flatten to 2D with a reshaping predict_fn
                     flat_inputs = inputs_np.reshape(inputs_np.shape[0], -1)
                     flat_bg = bg_np.reshape(bg_np.shape[0], -1)
@@ -259,9 +315,11 @@ class SHAPExplainer(BaseExplainer):
                             orig_shape = tuple(values.shape)
                 else:
                     # Tabular 2D data
+                    num_features = inputs_np.shape[1] if inputs_np.ndim > 1 else inputs_np.shape[0]
+                    effective_max_evals = max(max_evals, 2 * num_features + 1)
                     explainer = shap.Explainer(predict_fn, bg_np)
                     try:
-                        shap_values = explainer(inputs_np, max_evals=max_evals)
+                        shap_values = explainer(inputs_np, max_evals=effective_max_evals)
                     except Exception:
                         shap_values = explainer(inputs_np)
                     values = shap_values.values if hasattr(shap_values, "values") else np.asarray(shap_values)
@@ -272,9 +330,9 @@ class SHAPExplainer(BaseExplainer):
                         values = values[idx]
                     elif isinstance(values, np.ndarray):
                         orig_shape = tuple(values.shape)
-                        # Slice ONLY when values.ndim == inputs_np.ndim + 1
-                        if values.ndim == inputs_np.ndim + 1 and target_class is not None:
-                            c_idx = target_class if target_class < values.shape[-1] else 0
+                        # Slice target class when multi-class output (values.ndim == inputs_np.ndim + 1)
+                        if values.ndim == inputs_np.ndim + 1:
+                            c_idx = (target_class if target_class < values.shape[-1] else 0) if target_class is not None else 0
                             values = values[..., c_idx]
 
             return {
@@ -286,10 +344,14 @@ class SHAPExplainer(BaseExplainer):
                 "unsliced_shape": orig_shape,
             }
         except Exception as e:
+            import traceback
+            tb_str = traceback.format_exc()
             return {
                 "status": "error",
                 "executed": False,
                 "technique": "shap",
-                "message": f"SHAP computation error: {str(e)}",
+                "message": f"SHAP computation error: {type(e).__name__}: {str(e)}",
+                "exception_type": type(e).__name__,
+                "traceback": tb_str,
                 "attribution": None,
             }
