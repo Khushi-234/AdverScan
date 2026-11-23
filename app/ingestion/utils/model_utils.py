@@ -142,18 +142,125 @@ def detect_model_source(model_or_path: Any) -> str:
     return "local"
 
 
+_HF_REPO_INFO_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def detect_hf_repo_info(repo_id: str) -> Dict[str, Any]:
+    """
+    Inspect a Hugging Face repository's files, model card, tags, and config.
+    Returns detected framework, domain, task_type, model_files, and card details.
+    Uses caching to avoid repeated API calls.
+    """
+    clean_id = repo_id.strip()
+    if clean_id in _HF_REPO_INFO_CACHE:
+        return _HF_REPO_INFO_CACHE[clean_id]
+
+    res: Dict[str, Any] = {
+        "framework": "unknown",
+        "domain": "unknown",
+        "task_type": "classification",
+        "library_name": None,
+        "pipeline_tag": None,
+        "files": [],
+        "model_file": None,
+        "is_model_repo": False,
+    }
+
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+
+        # 1. Fetch file list
+        files: List[str] = []
+        try:
+            files = api.list_repo_files(clean_id)
+            res["files"] = files
+        except Exception:
+            files = []
+
+        # 2. Fetch model metadata / card data
+        tags: List[str] = []
+        try:
+            info = api.model_info(clean_id)
+            res["library_name"] = getattr(info, "library_name", None)
+            res["pipeline_tag"] = getattr(info, "pipeline_tag", None)
+            tags = [t.lower() for t in (getattr(info, "tags", []) or [])]
+        except Exception:
+            info = None
+
+        lib = (res["library_name"] or "").lower()
+        p_tag = (res["pipeline_tag"] or "").lower()
+
+        # 3. Detect Framework
+        has_sklearn_files = any(
+            f in ("model.joblib", "model.pkl", "model.pickle") or f.endswith((".joblib", ".pkl", ".pickle"))
+            for f in files
+        )
+        has_keras_files = any(
+            f in ("saved_model.pb", "keras_metadata.pb", "model.keras") or f.endswith((".keras", ".h5"))
+            for f in files
+        )
+        has_onnx_files = any(f.endswith(".onnx") for f in files)
+        has_jax_files = any(f.endswith((".msgpack", ".flax")) for f in files)
+        has_pytorch_files = any(f.endswith((".safetensors", ".bin", ".pt", ".pth")) for f in files)
+
+        if has_pytorch_files or "pytorch" in tags or "transformers" in lib:
+            res["framework"] = "pytorch"
+            res["is_model_repo"] = True
+        elif "sklearn" in lib or "sklearn" in tags or "skops" in tags or has_sklearn_files:
+            res["framework"] = "sklearn"
+            res["is_model_repo"] = True
+            for cand in ("clf.pkl", "sklearn_model.joblib", "model.joblib", "model.pkl", "model.pickle"):
+                if cand in files:
+                    res["model_file"] = cand
+                    break
+        elif any(k in lib for k in ("tf-keras", "keras", "tensorflow")) or has_keras_files:
+            res["framework"] = "keras"
+            res["is_model_repo"] = True
+        elif "onnx" in lib or has_onnx_files:
+            res["framework"] = "onnx"
+            res["is_model_repo"] = True
+        elif any(k in lib for k in ("flax", "jax")) or has_jax_files:
+            res["framework"] = "jax"
+            res["is_model_repo"] = True
+
+        # 4. Detect Domain
+        if any(k in p_tag for k in ("tabular", "tabular-classification", "tabular-regression")) or "tabular-classification" in tags:
+            res["domain"] = "tabular"
+        elif any(k in p_tag for k in ("time-series", "forecasting", "timeseries")) or any("time-series" in t for t in tags):
+            res["domain"] = "time-series"
+        elif any(k in p_tag for k in ("text", "nlp", "sentence-similarity", "translation", "summarization", "fill-mask")) or "text-classification" in tags:
+            res["domain"] = "text"
+        elif any(k in p_tag for k in ("image", "vision", "object-detection", "segmentation")) or "image-classification" in tags:
+            res["domain"] = "image"
+        elif res["framework"] == "sklearn":
+            res["domain"] = "tabular"
+
+        # 5. Detect Task Type
+        if any(k in p_tag for k in ("forecasting", "time-series-forecasting", "regression")):
+            res["task_type"] = "forecasting" if "forecasting" in p_tag else "regression"
+        else:
+            res["task_type"] = "classification"
+
+    except Exception:
+        pass
+
+    _HF_REPO_INFO_CACHE[clean_id] = res
+    return res
+
+
 def detect_model_framework(
     model_or_path: Any,
     framework_override: Optional[str] = None,
     model_class: Optional[Any] = None,
 ) -> str:
     """
-    Determine model framework ('sklearn', 'pytorch', 'tensorflow').
+    Determine model framework ('sklearn', 'pytorch', 'tensorflow', 'keras', 'onnx', 'jax').
     Never conflates source ('huggingface') with execution framework.
     """
     if framework_override:
         clean = framework_override.lower().strip()
-        if clean in ("pytorch", "pytorch_local", "sklearn", "tensorflow"):
+        if clean in ("pytorch", "pytorch_local", "sklearn", "tensorflow", "keras", "onnx", "jax"):
             return clean
 
     # 1. In-memory inspection
@@ -166,7 +273,7 @@ def detect_model_framework(
     if is_sklearn_model(model_or_path):
         return "sklearn"
 
-    # 2. File extension inspection
+    # 2. File extension and repository inspection
     if isinstance(model_or_path, (str, Path)):
         p_str = str(model_or_path).lower()
         if p_str.endswith((".pt", ".pth", ".safetensors", ".ckpt", ".bin")):
@@ -175,10 +282,20 @@ def detect_model_framework(
             return "sklearn"
         if p_str.endswith((".pkl", ".pickle")):
             return "sklearn"
-        # Check Hugging Face repos for scikit-learn estimators
+        if p_str.endswith((".onnx",)):
+            return "onnx"
+
+        # Check Hugging Face repos dynamically
         if "/" in p_str and not p_str.startswith((".", "/")):
+            hf_info = detect_hf_repo_info(str(model_or_path))
+            if hf_info.get("framework") and hf_info["framework"] != "unknown":
+                return hf_info["framework"]
+
             if p_str.startswith("scikit-learn/") or "sklearn" in p_str:
                 return "sklearn"
+            if p_str.startswith("keras-io/") or "keras" in p_str:
+                return "keras"
+
             try:
                 from huggingface_hub import hf_hub_download
                 cfg_p = hf_hub_download(str(model_or_path), "config.json", local_files_only=True)
@@ -269,7 +386,7 @@ def detect_model_domain(
     # 2. Check processor / tokenizer name
     if processor_name and isinstance(processor_name, str):
         proc_lower = processor_name.lower().replace("_", "-")
-        if any(k in proc_lower for k in ("tabular", "tab-processor", "tabular-processor")):
+        if any(k in proc_lower for k in ("tabular", "tab-processor", "tabular-processor", "tabpfn")):
             return "tabular"
         if any(k in proc_lower for k in ("timeseries", "time-series", "ts-processor")):
             return "time-series"
@@ -319,7 +436,7 @@ def detect_model_domain(
 
     if target_model is not None:
         cls_name = target_model.__class__.__name__.lower()
-        if any(k in cls_name for k in ("tabular", "tabnet", "fttransformer", "tabtransformer", "tabularmlp", "tabularclassifier")):
+        if any(k in cls_name for k in ("tabular", "tabnet", "fttransformer", "tabtransformer", "tabularmlp", "tabularclassifier", "tabpfn")):
             return "tabular"
         ts_model_keywords = (
             "patchtst", "patchtsmixer", "timesnet", "informer", "autoformer",
@@ -358,6 +475,12 @@ def detect_model_domain(
     if isinstance(model_or_path, str):
         name_lower = model_or_path.lower().replace("_", "-")
 
+        # Check Hugging Face repos dynamically first
+        if "/" in model_or_path and not model_or_path.startswith((".", "/")):
+            hf_info = detect_hf_repo_info(model_or_path)
+            if hf_info.get("domain") and hf_info["domain"] != "unknown":
+                return hf_info["domain"]
+
         text_keywords = (
             "bert", "roberta", "gpt", "llama", "t5", "bart", "electra", "distilbert",
             "albert", "deberta", "sentiment", "imdb", "nlp", "sequenceclassification",
@@ -376,7 +499,7 @@ def detect_model_domain(
             "lstm", "gru"
         )
         tabular_keywords = (
-            "tabular", "tabnet", "tabtransformer", "fttransformer", "tabularmlp"
+            "tabular", "tabnet", "tabtransformer", "fttransformer", "tabularmlp", "tabpfn"
         )
 
         # Fast local name keyword matching first

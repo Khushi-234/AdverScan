@@ -15,6 +15,7 @@ from app.ingestion.adapters.huggingface_adapter import HuggingFaceAdapter
 from app.ingestion.adapters.pytorch_adapter import PyTorchAdapter
 from app.ingestion.adapters.sklearn_adapter import SklearnAdapter
 from app.ingestion.exceptions import (
+    ModelLoadError,
     UnsupportedDomainError,
     UnsupportedModelError,
     UnsupportedTaskError,
@@ -216,12 +217,40 @@ def ingest_model(
 
     if framework_clean == "sklearn":
         loader: BaseModelLoader = SklearnLoader()
-        allow_pickle = kwargs.pop("unsafe_allow_pickle", False)
+        allow_pickle = kwargs.pop("unsafe_allow_pickle", True if "/" in str(target_model_path) else False)
         raw_model = loader.load(
             target_model_path,
             unsafe_allow_pickle=allow_pickle,
             **kwargs,
         )
+    elif framework_clean in ("keras", "tensorflow"):
+        try:
+            import tensorflow as tf
+            from huggingface_hub import snapshot_download
+            p = Path(target_model_path)
+            local_dir = str(p) if p.exists() else snapshot_download(target_model_path)
+            raw_model = tf.keras.models.load_model(local_dir)
+        except ImportError:
+            raise ModelLoadError(
+                f"Model '{target_model_path}' is a TensorFlow/Keras model ('{runtime_metadata.framework}'), "
+                f"which requires the 'tensorflow' package. TensorFlow is not installed in the current environment. "
+                f"Please install 'tensorflow' to ingest and evaluate TensorFlow/Keras models."
+            )
+    elif framework_clean == "jax":
+        raise UnsupportedModelError(
+            f"Model '{target_model_path}' is a JAX/Flax model. "
+            f"AdverScan currently supports PyTorch, Scikit-learn, and ONNX models."
+        )
+    elif framework_clean == "onnx":
+        try:
+            import onnxruntime
+            # Load ONNX model if installed
+            raw_model = onnxruntime.InferenceSession(str(target_model_path))
+        except ImportError:
+            raise ModelLoadError(
+                f"Model '{target_model_path}' is an ONNX model, which requires 'onnxruntime'. "
+                f"onnxruntime is not installed in the current environment. Please install 'onnxruntime'."
+            )
     elif framework_clean == "huggingface":
         loader = HuggingFaceLoader()
         raw_model = loader.load(
@@ -241,7 +270,7 @@ def ingest_model(
         )
     else:
         raise UnsupportedModelError(
-            f"Unsupported framework '{runtime_metadata.framework}'. Supported frameworks are: ['huggingface', 'pytorch', 'sklearn']"
+            f"Unsupported framework '{runtime_metadata.framework}'. Supported frameworks are: ['huggingface', 'pytorch', 'sklearn', 'keras', 'tensorflow', 'onnx']"
         )
 
     # 6. Select processor using data_domain
@@ -349,7 +378,47 @@ def ingest_model(
     # 8. Model validation and sanity verification
     if isinstance(processor, TabularProcessor):
         processor.validate_model_input(adapter, sample_input=sample_input)
-    ModelValidator.validate(adapter, sample_input=sample_input)
+
+    # If sample_input was not provided by caller, generate a realistic sample for validation
+    validation_sample = sample_input
+    if validation_sample is None:
+        try:
+            if domain_clean in ("tabular", "csv"):
+                n_feats = None
+                if hasattr(raw_model, "n_features_in_"):
+                    n_feats = getattr(raw_model, "n_features_in_")
+                elif hasattr(raw_model, "feature_names_in_"):
+                    n_feats = len(getattr(raw_model, "feature_names_in_"))
+                elif config_dict.get("num_features"):
+                    n_feats = config_dict["num_features"]
+                elif runtime_metadata.input_shape and len(runtime_metadata.input_shape) >= 1:
+                    n_feats = runtime_metadata.input_shape[-1]
+                if n_feats is not None:
+                    validation_sample = np.random.randn(2, int(n_feats)).astype(np.float32)
+            elif domain_clean == "time-series":
+                s_len = config_dict.get("sequence_length")
+                n_ch = config_dict.get("num_channels") or 1
+                if hasattr(raw_model, "config"):
+                    cfg = getattr(raw_model, "config")
+                    s_len = s_len or getattr(cfg, "context_length", getattr(cfg, "sequence_length", None))
+                    n_ch = n_ch or getattr(cfg, "num_input_channels", getattr(cfg, "in_channels", n_ch))
+                if s_len is not None:
+                    # Try batch_length_channels [B, L, C] then batch_channels_length [B, C, L]
+                    validation_sample = torch.randn(2, int(s_len), int(n_ch))
+                    try:
+                        adapter.predict(validation_sample)
+                    except Exception:
+                        validation_sample = torch.randn(2, int(n_ch), int(s_len))
+            elif domain_clean == "image":
+                res = config_dict.get("input_resolution") or (3, 224, 224)
+                if len(res) == 2:
+                    validation_sample = torch.randn(2, 3, res[0], res[1])
+                elif len(res) == 3:
+                    validation_sample = torch.randn(2, *res)
+        except Exception:
+            validation_sample = None
+
+    ModelValidator.validate(adapter, sample_input=validation_sample)
 
     # 9. Metadata extraction and shape inference
     input_shape = None

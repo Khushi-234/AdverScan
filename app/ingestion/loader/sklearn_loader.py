@@ -54,7 +54,7 @@ class SklearnLoader(BaseModelLoader):
                 try:
                     from huggingface_hub import hf_hub_download
                     local_f = None
-                    for candidate in ("model.joblib", "model.pkl", "model.pickle"):
+                    for candidate in ("clf.pkl", "sklearn_model.joblib", "model.joblib", "model.pkl", "model.pickle", "estimator.joblib", "model.bin"):
                         try:
                             local_f = hf_hub_download(path_str, candidate)
                             break
