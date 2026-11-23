@@ -488,7 +488,43 @@ def _generate_domain_sample_batch(
         inputs = torch.rand(sample_size, 3, 224, 224)
         labels = torch.randint(0, num_classes, (sample_size,))
     elif domain in ("tabular", "csv"):
-        num_features = getattr(metadata, "num_features", 14) or 14
+        # Discover num_features dynamically
+        num_features = None
+        if raw_model is not None:
+            if hasattr(raw_model, "n_features_in_"):
+                num_features = getattr(raw_model, "n_features_in_")
+            elif hasattr(raw_model, "feature_names_in_"):
+                num_features = len(getattr(raw_model, "feature_names_in_"))
+            elif hasattr(raw_model, "n_features_"):
+                num_features = getattr(raw_model, "n_features_")
+            elif hasattr(raw_model, "named_parameters"):
+                # Inspect first linear layer weight in PyTorch
+                for p_name, param in raw_model.named_parameters():
+                    if "weight" in p_name and len(param.shape) == 2:
+                        num_features = param.shape[1]
+                        break
+
+        if num_features is None and metadata is not None:
+            num_features = getattr(metadata, "num_features", None)
+            if num_features is None and getattr(metadata, "input_shape", None):
+                in_shape = metadata.input_shape
+                if len(in_shape) >= 1:
+                    num_features = in_shape[-1]
+            if num_features is None:
+                extra = getattr(metadata, "extra_info", {}) or {}
+                num_features = extra.get("num_features")
+
+        if num_features is None and preset_info:
+            num_features = preset_info.get("num_features")
+
+        if num_features is None:
+            raise ConfigurationError(
+                f"Cannot determine number of tabular features for model '{getattr(metadata, 'model_id', 'unknown')}'. "
+                f"Model has no 'n_features_in_' attribute and no 'num_features' configuration was provided. "
+                f"Please specify 'num_features' explicitly in configuration."
+            )
+
+        num_features = int(num_features)
         inputs = torch.randn(sample_size, num_features)
         labels = torch.randint(0, num_classes, (sample_size,))
     elif domain in ("time-series", "timeseries", "sequence"):
@@ -511,7 +547,7 @@ def _generate_domain_sample_batch(
         if num_channels is None and preset_info:
             num_channels = preset_info.get("num_channels") or preset_info.get("num_input_channels")
 
-        if seq_len is None:
+        if seq_len is None and metadata is not None:
             extra = getattr(metadata, "extra_info", {}) or {}
             seq_len = getattr(metadata, "sequence_length", None) or extra.get("sequence_length") or extra.get("context_length")
             if seq_len is None and getattr(metadata, "input_shape", None):
@@ -519,12 +555,27 @@ def _generate_domain_sample_batch(
                 if len(in_shape) >= 2:
                     seq_len = in_shape[0] if in_shape[0] > in_shape[1] else in_shape[1]
 
-        if num_channels is None:
+        if num_channels is None and metadata is not None:
             extra = getattr(metadata, "extra_info", {}) or {}
-            num_channels = getattr(metadata, "num_channels", None) or extra.get("num_channels") or getattr(metadata, "num_features", 1)
+            num_channels = getattr(metadata, "num_channels", None) or extra.get("num_channels") or getattr(metadata, "num_features", None)
 
-        seq_len = int(seq_len or 32)
-        num_channels = int(num_channels or 1)
+        # PyTorch model layer inspection if still None
+        if num_channels is None and raw_model is not None and hasattr(raw_model, "named_parameters"):
+            for p_name, param in raw_model.named_parameters():
+                if ("conv" in p_name or "fc" in p_name or "linear" in p_name) and "weight" in p_name:
+                    if len(param.shape) >= 2:
+                        num_channels = param.shape[1]
+                        break
+
+        if seq_len is None or num_channels is None:
+            raise ConfigurationError(
+                f"Cannot determine time-series input dimensions for model '{getattr(metadata, 'model_id', 'unknown')}'. "
+                f"Discovered seq_len={seq_len}, num_channels={num_channels}. "
+                f"Please provide 'sequence_length' and 'num_channels' in configuration."
+            )
+
+        seq_len = int(seq_len)
+        num_channels = int(num_channels)
 
         inputs = torch.randn(sample_size, seq_len, num_channels)
         labels = torch.randint(0, num_classes, (sample_size,))

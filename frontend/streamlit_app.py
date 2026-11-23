@@ -714,10 +714,12 @@ elif stage == "ingestion":
             )
 
         if active_data and active_data.get("is_synthetic_dataset"):
-            st.warning(
-                "⚠️ **Synthetic Fallback Data Active:** The requested dataset could not be loaded; "
-                "synthetic inputs were generated to allow functional inspection. "
-                "These results must **not** be presented as a real dataset robustness experiment."
+            fallback_reason_msg = active_data.get("dataset_fallback_reason") or "Real dataset could not be located or loaded"
+            st.error(
+                f"🚨 **CRITICAL WARNING — SYNTHETIC FALLBACK DATA IN USE**\n\n"
+                f"**Failure Reason:** `{fallback_reason_msg}`\n\n"
+                f"**Data Provenance:** The requested real evaluation dataset was unavailable. Randomly generated synthetic samples matching the model's discovered input dimensions are currently populated.\n\n"
+                f"**Methodological Impact:** Any subsequent attack evaluations, robustness scores, or ASR percentages will reflect synthetic random distribution and **must NOT** be presented or reported as authentic empirical model evaluations."
             )
 
         st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
@@ -752,10 +754,18 @@ elif stage == "attack_config":
         st.stop()
 
     # Synthetic fallback alert (A05)
+    synthetic_confirmed = True
     if active_data.get("is_synthetic_dataset"):
-        st.warning(
-            "⚠️ **Notice: Operating on Synthetic Fallback Data.** "
-            "Real evaluation dataset was unavailable. Generated samples are in use for demonstration."
+        fallback_reason_msg = active_data.get("dataset_fallback_reason") or "Real dataset could not be loaded"
+        st.error(
+            f"🚨 **Operating on Synthetic Fallback Data**\n\n"
+            f"**Failure Reason:** `{fallback_reason_msg}`\n\n"
+            f"**Notice:** No real benchmark dataset is loaded. Adversarial perturbations will be computed against synthetic data."
+        )
+        synthetic_confirmed = st.checkbox(
+            "I acknowledge that evaluation is running on synthetic data and should only be used for pipeline testing.",
+            value=False,
+            key="confirm_synthetic_eval",
         )
 
     model_adapter = active_data["adapter"]
@@ -1557,7 +1567,7 @@ elif stage == "attack_config":
             "Execute Adversarial Attack ⚡",
             type="primary",
             use_container_width=True,
-            disabled=not valid_params,
+            disabled=(not valid_params) or (active_data.get("is_synthetic_dataset") and not synthetic_confirmed),
         )
 
     if run_btn and valid_params:
