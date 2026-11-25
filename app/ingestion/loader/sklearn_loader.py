@@ -53,8 +53,20 @@ class SklearnLoader(BaseModelLoader):
             if "/" in path_str and not path_str.startswith((".", "/")):
                 try:
                     from huggingface_hub import hf_hub_download
+                    from app.ingestion.utils.model_utils import detect_hf_repo_info
+                    hf_info = detect_hf_repo_info(path_str)
+                    candidates: List[str] = []
+                    if hf_info.get("model_file") and str(hf_info["model_file"]).endswith((".joblib", ".pkl", ".pickle")):
+                        candidates.append(str(hf_info["model_file"]))
+                    for f in hf_info.get("files", []):
+                        if str(f).endswith((".joblib", ".pkl", ".pickle")) and f not in candidates:
+                            candidates.append(f)
+                    for c in ("clf.pkl", "sklearn_model.joblib", "model.joblib", "model.pkl", "model.pickle", "estimator.joblib", "model.bin"):
+                        if c not in candidates:
+                            candidates.append(c)
+
                     local_f = None
-                    for candidate in ("clf.pkl", "sklearn_model.joblib", "model.joblib", "model.pkl", "model.pickle", "estimator.joblib", "model.bin"):
+                    for candidate in candidates:
                         try:
                             local_f = hf_hub_download(path_str, candidate)
                             break
@@ -107,6 +119,40 @@ class SklearnLoader(BaseModelLoader):
         except Exception as e:
             raise ModelLoadError(f"Failed to load scikit-learn model from {path}: {str(e)}") from e
 
+    @staticmethod
+    def inspect_preprocessing(model: Any) -> dict:
+        """
+        Inspect whether a scikit-learn estimator has attached preprocessing (e.g. Pipeline/ColumnTransformer)
+        or is a raw estimator requiring external feature scaling/encoding.
+        """
+        steps_info: List[str] = []
+        has_preprocessing = False
+        requires_config = False
+        warning: Optional[str] = None
+
+        if hasattr(model, "steps") and isinstance(getattr(model, "steps"), list):
+            steps_info = [f"{name}:{step.__class__.__name__}" for name, step in model.steps]
+            # Any step prior to the final estimator is preprocessing
+            if len(model.steps) > 1:
+                has_preprocessing = True
+        elif hasattr(model, "transformers") or hasattr(model, "transformers_"):
+            has_preprocessing = True
+            steps_info = [model.__class__.__name__]
+        else:
+            requires_config = True
+            warning = (
+                f"Estimator '{model.__class__.__name__}' has no attached sklearn Pipeline preprocessing. "
+                f"If the model was trained on scaled, encoded, or imputed features, provide explicit "
+                f"preprocessing configuration (e.g. TabularProcessor preprocessor/feature_names) before evaluation."
+            )
+
+        return {
+            "has_preprocessing": has_preprocessing,
+            "preprocessing_steps": steps_info,
+            "requires_preprocessing_config": requires_config,
+            "warning": warning,
+        }
+
     def inspect_and_load(
         self,
         model_path: Union[str, Path, Any],
@@ -133,8 +179,12 @@ class SklearnLoader(BaseModelLoader):
         if hasattr(model, "classes_"):
             evidence.append(f"Classes detected: {len(model.classes_)}")
 
+        prep_info = self.inspect_preprocessing(model)
         evidence.append("Domain inferred as tabular from estimator interface")
-        evidence.append("Preprocessing metadata unavailable; assuming inputs match model space unless configured")
+        if prep_info["has_preprocessing"]:
+            evidence.append(f"Attached sklearn Pipeline preprocessing detected: {prep_info['preprocessing_steps']}")
+        else:
+            evidence.append(prep_info["warning"] or "Preprocessing metadata unavailable; assuming inputs match model space unless configured")
 
         return LoadResult(
             model=model,

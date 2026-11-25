@@ -12,6 +12,8 @@ import torch.nn as nn
 
 from app.ingestion.adapters.base_adapter import BaseModelAdapter
 from app.ingestion.adapters.huggingface_adapter import HuggingFaceAdapter
+from app.ingestion.adapters.keras_adapter import KerasAdapter
+from app.ingestion.adapters.onnx_adapter import ONNXAdapter
 from app.ingestion.adapters.pytorch_adapter import PyTorchAdapter
 from app.ingestion.adapters.sklearn_adapter import SklearnAdapter
 from app.ingestion.exceptions import (
@@ -217,7 +219,7 @@ def ingest_model(
 
     if framework_clean == "sklearn":
         loader: BaseModelLoader = SklearnLoader()
-        allow_pickle = kwargs.pop("unsafe_allow_pickle", True if "/" in str(target_model_path) else False)
+        allow_pickle = kwargs.pop("unsafe_allow_pickle", False)
         raw_model = loader.load(
             target_model_path,
             unsafe_allow_pickle=allow_pickle,
@@ -244,8 +246,22 @@ def ingest_model(
     elif framework_clean == "onnx":
         try:
             import onnxruntime
-            # Load ONNX model if installed
-            raw_model = onnxruntime.InferenceSession(str(target_model_path))
+            p = Path(target_model_path)
+            if p.is_file():
+                raw_model = onnxruntime.InferenceSession(str(p))
+            elif "/" in str(target_model_path) and not str(target_model_path).startswith((".", "/")):
+                from huggingface_hub import hf_hub_download
+                from app.ingestion.utils.model_utils import detect_hf_repo_info
+                hf_info = detect_hf_repo_info(str(target_model_path))
+                onnx_file = hf_info.get("model_file") or next(
+                    (f for f in hf_info.get("files", []) if str(f).endswith(".onnx")), None
+                )
+                if not onnx_file:
+                    raise ModelLoadError(f"No .onnx model file found in Hugging Face repository '{target_model_path}'.")
+                local_onnx = hf_hub_download(str(target_model_path), onnx_file)
+                raw_model = onnxruntime.InferenceSession(local_onnx)
+            else:
+                raw_model = onnxruntime.InferenceSession(str(target_model_path))
         except ImportError:
             raise ModelLoadError(
                 f"Model '{target_model_path}' is an ONNX model, which requires 'onnxruntime'. "
@@ -336,10 +352,25 @@ def ingest_model(
             f"Unsupported data domain '{domain_clean}'. Current scope supports only ['image', 'text', 'time-series', 'tabular']."
         )
 
-    # 7. Select adapter using framework / data_domain
+    # 7. Select adapter using actual loaded model / framework / data_domain
     adapter: BaseModelAdapter
-    if framework_clean == "sklearn":
+    if framework_clean == "sklearn" or is_sklearn_model(raw_model):
         adapter = SklearnAdapter(
+            raw_model,
+            device=target_device,
+            processor=processor,
+            data_domain=domain_clean,
+        )
+        runtime_metadata.extra_info["preprocessing"] = SklearnLoader.inspect_preprocessing(raw_model)
+    elif framework_clean == "onnx" or (hasattr(raw_model, "run") and hasattr(raw_model, "get_inputs")):
+        adapter = ONNXAdapter(
+            raw_model,
+            device=target_device,
+            processor=processor,
+            data_domain=domain_clean,
+        )
+    elif framework_clean in ("keras", "tensorflow") or (not isinstance(raw_model, nn.Module) and hasattr(raw_model, "predict")):
+        adapter = KerasAdapter(
             raw_model,
             device=target_device,
             processor=processor,
@@ -393,8 +424,15 @@ def ingest_model(
                     n_feats = config_dict["num_features"]
                 elif runtime_metadata.input_shape and len(runtime_metadata.input_shape) >= 1:
                     n_feats = runtime_metadata.input_shape[-1]
+                elif hasattr(raw_model, "named_parameters"):
+                    for p_name, param in raw_model.named_parameters():
+                        if "weight" in p_name and len(param.shape) == 2:
+                            n_feats = int(param.shape[1])
+                            break
                 if n_feats is not None:
                     validation_sample = np.random.randn(2, int(n_feats)).astype(np.float32)
+            elif domain_clean == "text" and processor is not None:
+                validation_sample = ["AdverScan validation sample text."]
             elif domain_clean == "time-series":
                 s_len = config_dict.get("sequence_length")
                 n_ch = config_dict.get("num_channels") or 1

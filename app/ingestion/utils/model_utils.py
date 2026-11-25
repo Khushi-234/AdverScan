@@ -145,10 +145,48 @@ def detect_model_source(model_or_path: Any) -> str:
 _HF_REPO_INFO_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
+def _parse_yaml_frontmatter(text: str) -> Dict[str, Any]:
+    """Extract simple key/value and list fields from README.md YAML frontmatter without requiring PyYAML."""
+    if not text or not text.startswith("---"):
+        return {}
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}
+    yaml_block = parts[1]
+    result: Dict[str, Any] = {}
+    current_key: Optional[str] = None
+    for raw_line in yaml_block.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("- ") and current_key:
+            val = line[2:].strip().strip("'\"")
+            existing = result.get(current_key)
+            if isinstance(existing, list):
+                existing.append(val)
+            else:
+                result[current_key] = [val]
+            continue
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k = k.strip()
+            v = v.strip().strip("'\"")
+            current_key = k
+            if v:
+                if v.startswith("[") and v.endswith("]"):
+                    result[k] = [x.strip().strip("'\"") for x in v[1:-1].split(",") if x.strip()]
+                else:
+                    result[k] = v
+            else:
+                result[k] = []
+    return result
+
+
 def detect_hf_repo_info(repo_id: str) -> Dict[str, Any]:
     """
-    Inspect a Hugging Face repository's files, model card, tags, and config.
-    Returns detected framework, domain, task_type, model_files, and card details.
+    Inspect a Hugging Face repository's files, README.md/model card YAML metadata,
+    tags, and config.json.
+    Distinguishes model repositories from dataset, source-only, or incomplete repositories.
     Uses caching to avoid repeated API calls.
     """
     clean_id = repo_id.strip()
@@ -164,10 +202,12 @@ def detect_hf_repo_info(repo_id: str) -> Dict[str, Any]:
         "files": [],
         "model_file": None,
         "is_model_repo": False,
+        "repo_type": "unknown",
+        "error": None,
     }
 
     try:
-        from huggingface_hub import HfApi
+        from huggingface_hub import HfApi, hf_hub_download
         api = HfApi()
 
         # 1. Fetch file list
@@ -175,59 +215,132 @@ def detect_hf_repo_info(repo_id: str) -> Dict[str, Any]:
         try:
             files = api.list_repo_files(clean_id)
             res["files"] = files
-        except Exception:
+        except Exception as exc:
+            res["error"] = str(exc)
+            err_lower = str(exc).lower()
+            if "404" in err_lower or "401" in err_lower or "not found" in err_lower:
+                res["repo_type"] = "not_found"
             files = []
 
         # 2. Fetch model metadata / card data
         tags: List[str] = []
+        card_data: Dict[str, Any] = {}
         try:
             info = api.model_info(clean_id)
             res["library_name"] = getattr(info, "library_name", None)
             res["pipeline_tag"] = getattr(info, "pipeline_tag", None)
             tags = [t.lower() for t in (getattr(info, "tags", []) or [])]
+            raw_card = getattr(info, "card_data", None) or getattr(info, "cardData", None)
+            if isinstance(raw_card, dict):
+                card_data = raw_card
+            elif hasattr(raw_card, "to_dict"):
+                card_data = raw_card.to_dict() or {}
         except Exception:
             info = None
 
-        lib = (res["library_name"] or "").lower()
-        p_tag = (res["pipeline_tag"] or "").lower()
+        # Inspect README.md YAML frontmatter if metadata is missing
+        if (not res["library_name"] or not res["pipeline_tag"]) and any(f.lower() == "readme.md" for f in files):
+            try:
+                readme_name = next(f for f in files if f.lower() == "readme.md")
+                readme_path = hf_hub_download(clean_id, readme_name)
+                with open(readme_path, "r", encoding="utf-8", errors="ignore") as f:
+                    yaml_meta = _parse_yaml_frontmatter(f.read(8192))
+                if not res["library_name"] and yaml_meta.get("library_name"):
+                    res["library_name"] = str(yaml_meta["library_name"])
+                if not res["pipeline_tag"] and yaml_meta.get("pipeline_tag"):
+                    res["pipeline_tag"] = str(yaml_meta["pipeline_tag"])
+                if isinstance(yaml_meta.get("tags"), list):
+                    for t in yaml_meta["tags"]:
+                        if str(t).lower() not in tags:
+                            tags.append(str(t).lower())
+            except Exception:
+                pass
 
-        # 3. Detect Framework
-        has_sklearn_files = any(
-            f in ("model.joblib", "model.pkl", "model.pickle") or f.endswith((".joblib", ".pkl", ".pickle"))
-            for f in files
-        )
-        has_keras_files = any(
-            f in ("saved_model.pb", "keras_metadata.pb", "model.keras") or f.endswith((".keras", ".h5"))
-            for f in files
-        )
-        has_onnx_files = any(f.endswith(".onnx") for f in files)
-        has_jax_files = any(f.endswith((".msgpack", ".flax")) for f in files)
-        has_pytorch_files = any(f.endswith((".safetensors", ".bin", ".pt", ".pth")) for f in files)
+        # Inspect config.json if present
+        cfg_data: Dict[str, Any] = {}
+        if "config.json" in files:
+            try:
+                cfg_path = hf_hub_download(clean_id, "config.json")
+                with open(cfg_path, "r", encoding="utf-8", errors="ignore") as f:
+                    loaded_cfg = json.load(f)
+                if isinstance(loaded_cfg, dict):
+                    cfg_data = loaded_cfg
+                    if not res["pipeline_tag"] and cfg_data.get("pipeline_tag"):
+                        res["pipeline_tag"] = str(cfg_data["pipeline_tag"])
+            except Exception:
+                pass
 
-        if has_pytorch_files or "pytorch" in tags or "transformers" in lib:
+        lib = (res["library_name"] or str(card_data.get("library_name") or "")).lower()
+        p_tag = (res["pipeline_tag"] or str(card_data.get("pipeline_tag") or "")).lower()
+
+        # 3. Detect Framework & Weight Artifacts
+        sklearn_files = [f for f in files if f in ("model.joblib", "model.pkl", "model.pickle") or f.endswith((".joblib", ".pkl", ".pickle"))]
+        keras_files = [f for f in files if f in ("saved_model.pb", "keras_metadata.pb", "model.keras") or f.endswith((".keras", ".h5"))]
+        onnx_files = [f for f in files if f.endswith(".onnx")]
+        jax_files = [f for f in files if f.endswith((".msgpack", ".flax"))]
+        pytorch_files = [f for f in files if f.endswith((".safetensors", ".bin", ".pt", ".pth"))]
+
+        has_any_weights = bool(sklearn_files or keras_files or onnx_files or jax_files or pytorch_files)
+
+        if pytorch_files:
             res["framework"] = "pytorch"
             res["is_model_repo"] = True
-        elif "sklearn" in lib or "sklearn" in tags or "skops" in tags or has_sklearn_files:
+            res["model_file"] = pytorch_files[0]
+        elif sklearn_files or "sklearn" in lib or "sklearn" in tags or "skops" in tags or "sklearn" in cfg_data:
             res["framework"] = "sklearn"
-            res["is_model_repo"] = True
+            res["is_model_repo"] = bool(sklearn_files)
             for cand in ("clf.pkl", "sklearn_model.joblib", "model.joblib", "model.pkl", "model.pickle"):
-                if cand in files:
+                if cand in sklearn_files:
                     res["model_file"] = cand
                     break
-        elif any(k in lib for k in ("tf-keras", "keras", "tensorflow")) or has_keras_files:
+            if res["model_file"] is None and sklearn_files:
+                res["model_file"] = sklearn_files[0]
+        elif keras_files or any(k in lib for k in ("tf-keras", "keras", "tensorflow")):
             res["framework"] = "keras"
-            res["is_model_repo"] = True
-        elif "onnx" in lib or has_onnx_files:
+            res["is_model_repo"] = bool(keras_files)
+            if keras_files:
+                res["model_file"] = keras_files[0]
+        elif onnx_files or "onnx" in lib:
             res["framework"] = "onnx"
-            res["is_model_repo"] = True
-        elif any(k in lib for k in ("flax", "jax")) or has_jax_files:
+            res["is_model_repo"] = bool(onnx_files)
+            if onnx_files:
+                res["model_file"] = onnx_files[0]
+        elif jax_files or any(k in lib for k in ("flax", "jax")):
             res["framework"] = "jax"
-            res["is_model_repo"] = True
+            res["is_model_repo"] = bool(jax_files)
+            if jax_files:
+                res["model_file"] = jax_files[0]
+        elif "pytorch" in tags or "transformers" in lib or "architectures" in cfg_data:
+            res["framework"] = "pytorch"
+            res["is_model_repo"] = has_any_weights
+
+        # Classify repository type accurately
+        if res["is_model_repo"]:
+            res["repo_type"] = "model"
+        elif files:
+            lower_files = [f.lower() for f in files]
+            has_dataset_files = any(
+                f in ("dataset_info.json", "dataset_dict.json") or f.endswith((".parquet", ".arrow"))
+                for f in lower_files
+            ) or (
+                any(f.endswith((".csv", ".tsv", ".jsonl")) for f in lower_files)
+                and not cfg_data
+            )
+            has_code_only = all(
+                f.startswith(".") or f.endswith((".py", ".ipynb", ".md", ".txt", ".yml", ".yaml", ".json", ".toml", ".sh"))
+                for f in lower_files
+            )
+            if has_dataset_files:
+                res["repo_type"] = "dataset"
+            elif has_code_only:
+                res["repo_type"] = "source_only" if any(f.endswith((".py", ".ipynb")) for f in lower_files) else "incomplete"
+            else:
+                res["repo_type"] = "incomplete"
 
         # 4. Detect Domain
-        if any(k in p_tag for k in ("tabular", "tabular-classification", "tabular-regression")) or "tabular-classification" in tags:
+        if any(k in p_tag for k in ("tabular", "tabular-classification", "tabular-regression")) or "tabular-classification" in tags or "tabular" in tags:
             res["domain"] = "tabular"
-        elif any(k in p_tag for k in ("time-series", "forecasting", "timeseries")) or any("time-series" in t for t in tags):
+        elif any(k in p_tag for k in ("time-series", "forecasting", "timeseries")) or any("time-series" in t or "timeseries" in t for t in tags):
             res["domain"] = "time-series"
         elif any(k in p_tag for k in ("text", "nlp", "sentence-similarity", "translation", "summarization", "fill-mask")) or "text-classification" in tags:
             res["domain"] = "text"
@@ -242,8 +355,8 @@ def detect_hf_repo_info(repo_id: str) -> Dict[str, Any]:
         else:
             res["task_type"] = "classification"
 
-    except Exception:
-        pass
+    except Exception as exc:
+        res["error"] = str(exc)
 
     _HF_REPO_INFO_CACHE[clean_id] = res
     return res
