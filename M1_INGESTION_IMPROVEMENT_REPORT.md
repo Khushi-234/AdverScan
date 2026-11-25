@@ -1,116 +1,62 @@
 # AdverScan M1 (Model Ingestion) Improvement & Bug Fix Report
 
-## 1. Executive Summary
+## 1. Summary Table
 
-Module 1 (M1 - Model Ingestion) has been updated to provide robust, framework-aware, and domain-accurate ingestion for dynamically loaded Hugging Face models, with special emphasis on Time-Series and Tabular architectures. The silent synthetic dataset fallback behavior was eliminated in favor of transparent provenance reporting, dimension-aware shape discovery, and explicit UI gatekeeping.
-
-All 125 existing ingestion unit tests, 62 frontend tests, and 7 newly added regression tests pass with zero regressions.
-
----
-
-## 2. Root Cause Analysis of Ingestion Failures
-
-### 2.1. Model `keras-io/timeseries_transformer_classification`
-- **Hugging Face Hub Analysis**: Repository contains TensorFlow/Keras SavedModel artifacts (`saved_model.pb`, `keras_metadata.pb`, `variables/`), tagged with `tf-keras`. It does **not** contain Hugging Face Transformers `config.json` or PyTorch weights (`pytorch_model.bin`, `model.safetensors`).
-- **Root Cause**:
-  1. `HuggingFaceLoader` unconditionally assumed every Hugging Face Hub repository is a PyTorch Transformers model and attempted to load configuration via `AutoConfig.from_pretrained()`, failing with `OSError`.
-  2. The active Python virtual environment (`.venv`) does not have `tensorflow` installed.
-- **Resolution**:
-  - Implemented dynamic Hugging Face repository inspection via `detect_hf_repo_info()`, checking Hub tags (`tf-keras`), libraries, and files.
-  - When a Keras / TensorFlow model is identified, `HuggingFaceLoader` checks for TensorFlow availability. If missing, it raises an informative, actionable `ModelLoadError`:
-    > *"Hugging Face repository 'keras-io/timeseries_transformer_classification' contains a TensorFlow/Keras SavedModel, which requires the 'tensorflow' package. TensorFlow is not installed in the current environment. Please install 'tensorflow' to ingest and evaluate TensorFlow/Keras models."*
-
-### 2.2. Model `scikit-learn/cancer-prediction-trees`
-- **Hugging Face Hub Analysis**: Repository contains `model.pkl` (a pickled Scikit-learn tree ensemble with 30 input features) and `README.md`.
-- **Root Cause**:
-  1. `app/ingestion/model_registry.py` had a check order where any model path detected as a Hugging Face Hub model (`detected_source == "huggingface"`) immediately assigned `framework = "huggingface"`, bypassing framework inspection and routing to `HuggingFaceLoader` instead of `SklearnLoader`.
-  2. In `_generate_domain_sample_batch()`, tabular dimension generation had a hardcoded fallback of `num_features = 14`, which caused dimension mismatches against the 30-feature tree model.
-- **Resolution**:
-  - Updated `detect_model_framework()` and `ModelPresetRegistry.build_runtime_config()` to inspect repository files and metadata. Repositories containing `model.pkl` / `joblib` are resolved to `framework = "sklearn"`.
-  - Added dynamic delegation inside `HuggingFaceLoader.load()`: if an ingested Hugging Face repository is detected as Scikit-learn, it delegates loading to `SklearnLoader(unsafe_allow_pickle=True)`.
-  - Replaced hardcoded tabular dimensions with dynamic discovery from `raw_model.n_features_in_`, `feature_names_in_`, layer attributes, or metadata, raising a clear `ConfigurationError` if dimensions cannot be determined.
+| Improvement | Status | Files Modified | Test Result |
+|---|---|---|---|
+| Priority 1: HF Repo Inspection & Framework Routing | Implemented | `app/ingestion/utils/model_utils.py`, `app/ingestion/loader/huggingface_loader.py`, `app/ingestion/model_registry.py` | Passed (unit + mocked Hub) |
+| Priority 2: Framework Loaders & Adapters (PyTorch, Sklearn, Keras/TF, ONNX, JAX) | Implemented | `app/ingestion/adapters/onnx_adapter.py`, `app/ingestion/adapters/keras_adapter.py`, `app/ingestion/adapters/__init__.py`, `app/ingestion/pipeline.py`, `app/ingestion/loader/sklearn_loader.py` | Passed (135 passed, 2 skipped in `tests/ingestion/`) |
+| Priority 3 & 5: Forward-Pass Validation & Dimension Discovery | Implemented | `app/ingestion/pipeline.py`, `app/ingestion/validation/validator.py` | Passed |
+| Priority 4: Synthetic Dataset Fallback Warning & Gate | Blocked on current branch (`frontend/` is on `development`, not `feature/model-ingestion`) | N/A on `feature/model-ingestion` | 2 frontend tests skipped on this branch |
+| Priority 6: Standardized Input Adapters | Implemented | `app/ingestion/adapters/onnx_adapter.py`, `app/ingestion/adapters/keras_adapter.py`, `app/ingestion/pipeline.py` | Passed |
+| Priority 7: Scikit-learn Preprocessing Inspection | Implemented | `app/ingestion/loader/sklearn_loader.py`, `app/ingestion/pipeline.py` | Passed |
+| Priority 8 & 9: Targeted Tests & Regression Validation | Implemented & Executed | `tests/ingestion/test_dynamic_hf_and_fallback.py`, `tests/ingestion/test_validator.py` | `tests/ingestion/`: 135 passed, 2 skipped |
 
 ---
 
-## 3. Key Improvements Implemented
+## 2. Root Causes of Both Hugging Face Ingestion Errors
 
-### 3.1. Framework-Aware Hugging Face Inspection (`app/ingestion/utils/model_utils.py`)
-- Added `detect_hf_repo_info(repo_id: str) -> Dict[str, Any]` which queries `huggingface_hub.HfApi` for repository files, library tags, and pipeline tags:
-  - Framework detection: `sklearn` (`model.pkl`, `joblib`), `keras`/`tensorflow` (`saved_model.pb`, `*.h5`, `keras_metadata.pb`), `onnx` (`*.onnx`), `jax` (`flax_model.msgpack`), or `pytorch`.
-  - Domain detection: `tabular`, `time-series`, `image`, or `text`.
-- Updated `detect_model_framework()` to prioritize detected Hub frameworks before defaulting to `"huggingface"`.
+1. **`keras-io/timeseries_transformer_classification`**:
+   - The Hugging Face repository contains TensorFlow/Keras SavedModel artifacts (`saved_model.pb`, `keras_metadata.pb`, `variables/`) and is tagged `tf-keras`, without `config.json` or PyTorch weights.
+   - `HuggingFaceLoader` previously assumed all Hugging Face repositories were `transformers` PyTorch models and failed calling `AutoConfig.from_pretrained()`. Furthermore, `tensorflow` is not installed in `.venv`.
+   - **Fix**: `detect_hf_repo_info()` inspects repo files, `README.md` YAML frontmatter, `config.json`, and Hub metadata to detect `keras`/`tensorflow` and `time-series`. `HuggingFaceLoader` and `pipeline.py` route Keras/TF models cleanly and raise an actionable `ModelLoadError` when `tensorflow` is not installed (or wrap in `KerasAdapter` when available).
 
-### 3.2. Registry & Ingestion Pipeline Routing (`app/ingestion/model_registry.py`, `app/ingestion/pipeline.py`)
-- `ModelPresetRegistry.build_runtime_config()` now respects detected frameworks (`sklearn`, `keras`, `tensorflow`, `onnx`, `jax`).
-- `app/ingestion/pipeline.py`:
-  - Added loader dispatch for `keras`, `tensorflow`, and `onnx` with explicit dependency error checks.
-  - Added `_generate_validation_sample_input()` logic: when `sample_input` is not supplied by the caller, realistic domain-conforming samples are synthesized to verify the model forward-pass via `ModelValidator.validate(adapter, sample_input=validation_sample)`.
-
-### 3.3. Forward-Pass and Model State Validation (`app/ingestion/validation/validator.py`)
-- Expanded `SUPPORTED_FRAMEWORKS` to include `keras`, `tensorflow`, and `onnx`.
-- Enhanced `ModelValidator.validate()`:
-  - Verifies that model predictions are non-None.
-  - Verifies that output shape is non-empty (`dim != 0`).
-  - Verifies that predictions contain no `NaN` or `Inf` values.
-
-### 3.4. Elimination of Silent Synthetic Fallback (`frontend/services/ingestion_service.py`, `frontend/streamlit_app.py`)
-- **Dimension Discovery**: Replaced arbitrary hardcoded constants (`num_features = 14`, `seq_len = 32`, `num_channels = 1`) with deep reflection across model weights, layer shapes, config attributes (`n_features_in_`, `sequence_length`, `context_length`, `input_size`). If dimensions cannot be discovered, `ConfigurationError` is raised.
-- **Provenance & Telemetry**: When a dataset cannot be loaded, `load_model_and_dataset()` records:
-  - `is_synthetic_dataset = True`
-  - `dataset_source = "synthetic_fallback"`
-  - `dataset_fallback_reason = <actual error message>`
-- **UI Warning & Confirmation Gate**:
-  - In Streamlit Stage 2 (Active Model Details), a prominent critical alert is displayed detailing the failure reason, data provenance, and methodological limitations.
-  - In Streamlit Stage 3 (Attack Configuration), an acknowledgment checkbox is enforced:
-    > *"I acknowledge that evaluation is running on synthetic data and should only be used for pipeline testing."*
-    The `Execute Adversarial Attack ⚡` button remains disabled until this confirmation is checked.
+2. **`scikit-learn/cancer-prediction-trees`**:
+   - The Hugging Face repository contains `model.pkl` (a pickled scikit-learn tree ensemble) rather than a `transformers` model.
+   - `ModelPresetRegistry.build_runtime_config()` previously mapped any Hugging Face Hub identifier to `framework = "huggingface"`, bypassing `SklearnLoader`.
+   - **Fix**: `detect_hf_repo_info()` detects `.pkl`/`.joblib`/`.pickle` artifacts and `sklearn` metadata, `build_runtime_config()` routes to `framework = "sklearn"`, and `SklearnLoader` locates the exact Hub artifact (`model_file`) while enforcing `unsafe_allow_pickle` consent.
 
 ---
 
-## 4. Verification and Test Results
+## 3. Improvements Implemented
 
-### 4.1. Ingestion Test Suite
-```bash
-./.venv/bin/pytest tests/ingestion/ -v
-Result: 125 passed, 21 warnings in 16.96s
-```
-
-### 4.2. Frontend Test Suite
-```bash
-./.venv/bin/pytest tests/test_frontend.py -v
-Result: 62 passed, 3 warnings in 10.97s
-```
-
-### 4.3. Dynamic Hugging Face & Fallback Regression Tests
-```bash
-./.venv/bin/pytest tests/ingestion/test_dynamic_hf_and_fallback.py -v
-Result: 7 passed, 3 warnings in 5.44s
-```
-- `test_detect_hf_repo_info_sklearn`: Passed
-- `test_detect_hf_repo_info_keras_savedmodel`: Passed
-- `test_build_runtime_config_dynamic_routing_sklearn`: Passed
-- `test_hf_loader_keras_missing_tensorflow_raises_descriptive_error`: Passed
-- `test_generate_domain_sample_batch_dynamic_tabular_discovery`: Passed
-- `test_generate_domain_sample_batch_unknown_tabular_raises`: Passed
-- `test_validator_with_non_empty_forward_pass`: Passed
-
-### 4.4. Code Cleanliness Check
-```bash
-git diff --check
-Result: 0 errors
-```
+- **Hugging Face Repository Classification (`app/ingestion/utils/model_utils.py`)**:
+  - `detect_hf_repo_info()` inspects `HfApi.list_repo_files()`, `HfApi.model_info()`, `README.md` YAML frontmatter (`_parse_yaml_frontmatter()`), and `config.json`.
+  - Distinguishes `repo_type` across `"model"` (has actual serialized weights), `"dataset"` (`.parquet`/`.arrow`/`dataset_info.json`), `"source_only"` (`.py`/`.ipynb` only), `"incomplete"` (metadata/config without weights), and `"not_found"`.
+- **Framework-Specific Loaders & Adapters**:
+  - Added [onnx_adapter.py](file:///home/bisag/Downloads/M.Tech_Project_Juhi/AdverScan/AdverScan/app/ingestion/adapters/onnx_adapter.py) (`ONNXAdapter`) and [keras_adapter.py](file:///home/bisag/Downloads/M.Tech_Project_Juhi/AdverScan/AdverScan/app/ingestion/adapters/keras_adapter.py) (`KerasAdapter`), exported in [__init__.py](file:///home/bisag/Downloads/M.Tech_Project_Juhi/AdverScan/AdverScan/app/ingestion/adapters/__init__.py).
+  - Updated [pipeline.py](file:///home/bisag/Downloads/M.Tech_Project_Juhi/AdverScan/AdverScan/app/ingestion/pipeline.py) to support ONNX (local and HF Hub `.onnx` download), Keras/TF, Sklearn (restoring `unsafe_allow_pickle=False` default security boundary), and JAX/Flax (`UnsupportedModelError`).
+- **Scikit-learn Artifact Discovery & Preprocessing Inspection (`app/ingestion/loader/sklearn_loader.py`)**:
+  - Uses `detect_hf_repo_info()` to discover arbitrary `.joblib`/`.pkl`/`.pickle` filenames on HF Hub.
+  - Added `SklearnLoader.inspect_preprocessing()` to distinguish `Pipeline` / `ColumnTransformer` models with attached preprocessing from raw estimators lacking preprocessing, recording warnings and step details in `LoadResult.evidence` and `runtime_metadata.extra_info["preprocessing"]`.
+- **Forward-Pass Validation & Dimension Discovery (`app/ingestion/pipeline.py`, `app/ingestion/validation/validator.py`)**:
+  - Generates representative `validation_sample` inputs across `tabular` (including PyTorch `Linear` layer inspection), `time-series`, `image`, and `text` domains when `sample_input=None`, validating non-None, non-empty shape, and finite (non-NaN/Inf) outputs.
 
 ---
 
-## 5. Summary of Modified Files
+## 4. Test Results
 
-1. [app/ingestion/utils/model_utils.py](file:///home/bisag/Downloads/M.Tech_Project_Juhi/AdverScan/AdverScan/app/ingestion/utils/model_utils.py) — Added `detect_hf_repo_info` and dynamic Hub framework inspection.
-2. [app/ingestion/model_registry.py](file:///home/bisag/Downloads/M.Tech_Project_Juhi/AdverScan/AdverScan/app/ingestion/model_registry.py) — Dynamic framework routing for Hugging Face repos.
-3. [app/ingestion/loader/huggingface_loader.py](file:///home/bisag/Downloads/M.Tech_Project_Juhi/AdverScan/AdverScan/app/ingestion/loader/huggingface_loader.py) — Added tabular support, sklearn delegation, and descriptive missing framework handling.
-4. [app/ingestion/pipeline.py](file:///home/bisag/Downloads/M.Tech_Project_Juhi/AdverScan/AdverScan/app/ingestion/pipeline.py) — Support for Keras/TF/ONNX routing and dynamic forward-pass sample generation during validation.
-5. [app/ingestion/validation/validator.py](file:///home/bisag/Downloads/M.Tech_Project_Juhi/AdverScan/AdverScan/app/ingestion/validation/validator.py) — Extended framework support and non-empty output checks.
-6. [frontend/services/ingestion_service.py](file:///home/bisag/Downloads/M.Tech_Project_Juhi/AdverScan/AdverScan/frontend/services/ingestion_service.py) — Dynamic dimension discovery, removed hardcoded tabular/TS constants, explicit failure reasons.
-7. [frontend/streamlit_app.py](file:///home/bisag/Downloads/M.Tech_Project_Juhi/AdverScan/AdverScan/frontend/streamlit_app.py) — Critical synthetic data alert banner and user confirmation gate on attack execution.
-8. [tests/ingestion/test_validator.py](file:///home/bisag/Downloads/M.Tech_Project_Juhi/AdverScan/AdverScan/tests/ingestion/test_validator.py) — Updated validator test for extended frameworks.
-9. [tests/ingestion/test_dynamic_hf_and_fallback.py](file:///home/bisag/Downloads/M.Tech_Project_Juhi/AdverScan/AdverScan/tests/ingestion/test_dynamic_hf_and_fallback.py) — New targeted regression tests for M1 dynamic ingestion.
+- `tests/ingestion/`: **135 passed, 2 skipped** (`test_generate_domain_sample_batch_*` skipped because `frontend.services.ingestion_service` is not on the `feature/model-ingestion` branch).
+- `tests/vulnerability_analysis/` + `tests/attack_engine/`: **28 passed, 1 failed** (`tests/attack_engine/test_pgd.py::test_pgd_registration` failed pre-existing assertion `assert 'pgm' in ['deepfool', 'fgsm', 'pgd']`, unrelated to M1).
+- `tests/orchestration/test_orchestrator.py`: Collection error (`ImportError: cannot import name 'AdverScanOrchestrator'`) on `feature/model-ingestion` branch (orchestration module lives on `Orchestration`/`development`).
+- `git diff --check`: 0 whitespace/syntax errors.
 
+---
+
+## 5. Remaining Unsupported Formats & Blocked Functionality
+
+- **Unsupported / Missing Optional Dependencies in `.venv`**:
+  - `tensorflow` / `keras` and `onnxruntime` are not installed in `.venv`; models in these formats raise descriptive `ModelLoadError`s unless the optional package is installed.
+  - `jax` / `flax` models raise `UnsupportedModelError`.
+- **Blocked on Current Branch (`feature/model-ingestion`)**:
+  - **Priority 4 (Frontend Synthetic Dataset Fallback UI & `frontend/services/ingestion_service.py`)**: Those frontend files live on the `development` branch, not `feature/model-ingestion`. Per branch-preservation rules, `development` was not modified from this branch.
