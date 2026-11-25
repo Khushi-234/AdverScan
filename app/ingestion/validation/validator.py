@@ -21,7 +21,10 @@ class ModelValidator:
     and runtime configuration before loading.
     """
 
-    SUPPORTED_FRAMEWORKS = {"huggingface", "pytorch", "pytorch_local", "sklearn", "keras", "tensorflow", "onnx"}
+    SUPPORTED_FRAMEWORKS = {
+        "huggingface", "pytorch", "pytorch_local", "sklearn", "keras", "tensorflow", "onnx",
+        "xgboost", "lightgbm", "catboost", "openvino", "tensorrt", "coreml", "tflite", "paddle", "mxnet",
+    }
     SUPPORTED_DOMAINS = {"image", "text", "time-series", "tabular"}
 
     @classmethod

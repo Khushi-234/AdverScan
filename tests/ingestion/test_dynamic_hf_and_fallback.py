@@ -261,3 +261,61 @@ tags:
     assert parsed["pipeline_tag"] == "tabular-classification"
     assert "tabular" in parsed["tags"]
     assert "sklearn" in parsed["tags"]
+
+
+def test_tree_model_adapter_capabilities_and_inference():
+    """Test TreeModelAdapter exposes supports_gradients=False and standard predict/logits."""
+    from app.ingestion.adapters import TreeModelAdapter
+
+    class DummyBooster:
+        def predict(self, x, **kwargs):
+            # Return 1D binary probabilities [0.8, 0.2]
+            return np.array([0.8, 0.2], dtype=np.float32)
+
+    adapter = TreeModelAdapter(DummyBooster(), data_domain="tabular", framework="xgboost")
+
+    assert adapter.capabilities.supports_gradients is False
+    assert adapter.capabilities.supports_predict is True
+
+    preds = adapter.predict(torch.zeros((2, 4)))
+    assert isinstance(preds, torch.Tensor)
+    assert preds.shape == (2, 2)
+
+    logits = adapter.get_logits(torch.zeros((2, 4)))
+    assert isinstance(logits, torch.Tensor)
+    assert not torch.isnan(logits).any()
+
+
+def test_deployment_runtime_adapter_capabilities_and_inference():
+    """Test DeploymentRuntimeAdapter exposes supports_gradients=False and standard predict."""
+    from app.ingestion.adapters import DeploymentRuntimeAdapter
+
+    class DummyCompiledModel:
+        def __call__(self, inputs):
+            return [np.array([[0.1, 0.9]], dtype=np.float32)]
+
+    adapter = DeploymentRuntimeAdapter(DummyCompiledModel(), data_domain="image", runtime_name="openvino")
+
+    assert adapter.capabilities.supports_gradients is False
+    assert adapter.capabilities.supports_predict is True
+
+    preds = adapter.predict(torch.zeros((1, 3, 224, 224)))
+    assert isinstance(preds, torch.Tensor)
+    assert preds.shape == (1, 2)
+
+
+def test_pipeline_universal_format_detection_and_informative_errors():
+    """Test pipeline detects various formats and returns clear errors when dependencies are missing."""
+    with pytest.raises(UnsupportedModelError, match="Apache MXNet reached end-of-life"):
+        ingest_model("models/network.params")
+
+    with pytest.raises(UnsupportedModelError, match="TensorRT execution requires GPU runtime"):
+        ingest_model("models/network.engine")
+
+    with pytest.raises(ModelLoadError, match="requires 'openvino'"):
+        with patch.dict("sys.modules", {"openvino": None, "openvino.runtime": None}):
+            ingest_model("models/network.xml")
+
+    with pytest.raises(ModelLoadError, match="requires 'coremltools'"):
+        with patch.dict("sys.modules", {"coremltools": None}):
+            ingest_model("models/network.mlmodel")

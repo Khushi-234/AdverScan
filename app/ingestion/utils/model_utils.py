@@ -279,13 +279,71 @@ def detect_hf_repo_info(repo_id: str) -> Dict[str, Any]:
         onnx_files = [f for f in files if f.endswith(".onnx")]
         jax_files = [f for f in files if f.endswith((".msgpack", ".flax"))]
         pytorch_files = [f for f in files if f.endswith((".safetensors", ".bin", ".pt", ".pth"))]
+        xgboost_files = [f for f in files if f.endswith((".ubj",)) or ("xgboost" in f.lower() and f.endswith((".json", ".model")))]
+        lightgbm_files = [f for f in files if "lightgbm" in f.lower() and f.endswith((".txt", ".model"))]
+        catboost_files = [f for f in files if f.endswith((".cbm",))]
+        openvino_files = [f for f in files if f.endswith((".xml",))]
+        tensorrt_files = [f for f in files if f.endswith((".engine", ".plan"))]
+        coreml_files = [f for f in files if f.endswith((".mlmodel", ".mlpackage"))]
+        tflite_files = [f for f in files if f.endswith((".tflite",))]
+        paddle_files = [f for f in files if f.endswith((".pdmodel", ".pdparams"))]
+        mxnet_files = [f for f in files if f.endswith((".params",))]
 
-        has_any_weights = bool(sklearn_files or keras_files or onnx_files or jax_files or pytorch_files)
+        has_any_weights = bool(
+            sklearn_files or keras_files or onnx_files or jax_files or pytorch_files
+            or xgboost_files or lightgbm_files or catboost_files or openvino_files
+            or tensorrt_files or coreml_files or tflite_files or paddle_files or mxnet_files
+        )
 
         if pytorch_files:
             res["framework"] = "pytorch"
             res["is_model_repo"] = True
             res["model_file"] = pytorch_files[0]
+        elif xgboost_files or "xgboost" in lib or "xgboost" in tags:
+            res["framework"] = "xgboost"
+            res["is_model_repo"] = bool(xgboost_files)
+            if xgboost_files:
+                res["model_file"] = xgboost_files[0]
+        elif lightgbm_files or "lightgbm" in lib or "lightgbm" in tags:
+            res["framework"] = "lightgbm"
+            res["is_model_repo"] = bool(lightgbm_files)
+            if lightgbm_files:
+                res["model_file"] = lightgbm_files[0]
+        elif catboost_files or "catboost" in lib or "catboost" in tags:
+            res["framework"] = "catboost"
+            res["is_model_repo"] = bool(catboost_files)
+            if catboost_files:
+                res["model_file"] = catboost_files[0]
+        elif openvino_files or "openvino" in lib:
+            res["framework"] = "openvino"
+            res["is_model_repo"] = bool(openvino_files)
+            if openvino_files:
+                res["model_file"] = openvino_files[0]
+        elif tensorrt_files or "tensorrt" in lib:
+            res["framework"] = "tensorrt"
+            res["is_model_repo"] = bool(tensorrt_files)
+            if tensorrt_files:
+                res["model_file"] = tensorrt_files[0]
+        elif coreml_files or "coreml" in lib:
+            res["framework"] = "coreml"
+            res["is_model_repo"] = bool(coreml_files)
+            if coreml_files:
+                res["model_file"] = coreml_files[0]
+        elif tflite_files or "tflite" in lib:
+            res["framework"] = "tflite"
+            res["is_model_repo"] = bool(tflite_files)
+            if tflite_files:
+                res["model_file"] = tflite_files[0]
+        elif paddle_files or "paddle" in lib or "paddlepaddle" in tags:
+            res["framework"] = "paddle"
+            res["is_model_repo"] = bool(paddle_files)
+            if paddle_files:
+                res["model_file"] = paddle_files[0]
+        elif mxnet_files or "mxnet" in lib:
+            res["framework"] = "mxnet"
+            res["is_model_repo"] = bool(mxnet_files)
+            if mxnet_files:
+                res["model_file"] = mxnet_files[0]
         elif sklearn_files or "sklearn" in lib or "sklearn" in tags or "skops" in tags or "sklearn" in cfg_data:
             res["framework"] = "sklearn"
             res["is_model_repo"] = bool(sklearn_files)
@@ -373,7 +431,10 @@ def detect_model_framework(
     """
     if framework_override:
         clean = framework_override.lower().strip()
-        if clean in ("pytorch", "pytorch_local", "sklearn", "tensorflow", "keras", "onnx", "jax"):
+        if clean in (
+            "pytorch", "pytorch_local", "sklearn", "tensorflow", "keras", "onnx", "jax",
+            "xgboost", "lightgbm", "catboost", "openvino", "tensorrt", "coreml", "tflite", "paddle", "mxnet",
+        ):
             return clean
 
     # 1. In-memory inspection
@@ -383,6 +444,15 @@ def detect_model_framework(
     if model_class is not None and isinstance(model_class, type) and issubclass(model_class, torch.nn.Module):
         return "pytorch"
 
+    # Duck-typing for tree models
+    t_name = model_or_path.__class__.__name__.lower() if not isinstance(model_or_path, (str, Path)) else ""
+    if "xgb" in t_name or "xgboost" in t_name:
+        return "xgboost"
+    if "lgbm" in t_name or "lightgbm" in t_name:
+        return "lightgbm"
+    if "catboost" in t_name:
+        return "catboost"
+
     if is_sklearn_model(model_or_path):
         return "sklearn"
 
@@ -391,12 +461,32 @@ def detect_model_framework(
         p_str = str(model_or_path).lower()
         if p_str.endswith((".pt", ".pth", ".safetensors", ".ckpt", ".bin")):
             return "pytorch"
-        if p_str.endswith((".joblib",)):
-            return "sklearn"
-        if p_str.endswith((".pkl", ".pickle")):
+        if p_str.endswith((".joblib", ".pkl", ".pickle")):
             return "sklearn"
         if p_str.endswith((".onnx",)):
             return "onnx"
+        if p_str.endswith((".tflite",)):
+            return "tflite"
+        if p_str.endswith((".cbm",)):
+            return "catboost"
+        if p_str.endswith((".engine", ".plan")):
+            return "tensorrt"
+        if p_str.endswith((".mlmodel", ".mlpackage")):
+            return "coreml"
+        if p_str.endswith((".h5", ".hdf5", ".keras")):
+            return "keras"
+        if p_str.endswith((".pb",)):
+            return "tensorflow"
+        if p_str.endswith((".msgpack", ".flax")):
+            return "jax"
+        if p_str.endswith((".pdmodel", ".pdparams")):
+            return "paddle"
+        if p_str.endswith((".params",)):
+            return "mxnet"
+        if p_str.endswith((".xml",)):
+            return "openvino"
+        if p_str.endswith((".ubj",)):
+            return "xgboost"
 
         # Check Hugging Face repos dynamically
         if "/" in p_str and not p_str.startswith((".", "/")):

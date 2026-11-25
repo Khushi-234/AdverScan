@@ -11,11 +11,13 @@ import torch
 import torch.nn as nn
 
 from app.ingestion.adapters.base_adapter import BaseModelAdapter
+from app.ingestion.adapters.deployment_adapter import DeploymentRuntimeAdapter
 from app.ingestion.adapters.huggingface_adapter import HuggingFaceAdapter
 from app.ingestion.adapters.keras_adapter import KerasAdapter
 from app.ingestion.adapters.onnx_adapter import ONNXAdapter
 from app.ingestion.adapters.pytorch_adapter import PyTorchAdapter
 from app.ingestion.adapters.sklearn_adapter import SklearnAdapter
+from app.ingestion.adapters.tree_adapter import TreeModelAdapter
 from app.ingestion.exceptions import (
     ModelLoadError,
     UnsupportedDomainError,
@@ -238,10 +240,99 @@ def ingest_model(
                 f"which requires the 'tensorflow' package. TensorFlow is not installed in the current environment. "
                 f"Please install 'tensorflow' to ingest and evaluate TensorFlow/Keras models."
             )
+    elif framework_clean == "xgboost":
+        try:
+            import xgboost as xgb
+            p = Path(target_model_path)
+            if p.is_file():
+                raw_model = xgb.Booster()
+                raw_model.load_model(str(p))
+            else:
+                raw_model = target_model_path
+        except ImportError:
+            raise ModelLoadError(
+                f"Model '{target_model_path}' is an XGBoost model, which requires the 'xgboost' package. "
+                f"xgboost is not installed in the current environment. Please install 'xgboost'."
+            )
+    elif framework_clean == "lightgbm":
+        try:
+            import lightgbm as lgb
+            p = Path(target_model_path)
+            if p.is_file():
+                raw_model = lgb.Booster(model_file=str(p))
+            else:
+                raw_model = target_model_path
+        except ImportError:
+            raise ModelLoadError(
+                f"Model '{target_model_path}' is a LightGBM model, which requires the 'lightgbm' package. "
+                f"lightgbm is not installed in the current environment. Please install 'lightgbm'."
+            )
+    elif framework_clean == "catboost":
+        try:
+            import catboost as cb
+            p = Path(target_model_path)
+            if p.is_file():
+                raw_model = cb.CatBoostClassifier()
+                raw_model.load_model(str(p))
+            else:
+                raw_model = target_model_path
+        except ImportError:
+            raise ModelLoadError(
+                f"Model '{target_model_path}' is a CatBoost model, which requires the 'catboost' package. "
+                f"catboost is not installed in the current environment. Please install 'catboost'."
+            )
+    elif framework_clean == "openvino":
+        try:
+            import openvino.runtime as ov
+            core = ov.Core()
+            raw_model = core.compile_model(str(target_model_path), "CPU")
+        except ImportError:
+            raise ModelLoadError(
+                f"Model '{target_model_path}' is an OpenVINO model, which requires 'openvino'. "
+                f"openvino is not installed in the current environment. Please install 'openvino'."
+            )
+    elif framework_clean == "tensorrt":
+        raise UnsupportedModelError(
+            f"Model '{target_model_path}' is a TensorRT engine. "
+            f"TensorRT execution requires GPU runtime with NVIDIA TensorRT drivers. Non-GPU CPU environment is unsupported."
+        )
+    elif framework_clean == "coreml":
+        try:
+            import coremltools as ct
+            raw_model = ct.models.MLModel(str(target_model_path))
+        except ImportError:
+            raise ModelLoadError(
+                f"Model '{target_model_path}' is a Core ML model, which requires 'coremltools'. "
+                f"coremltools is not installed in the current environment. Please install 'coremltools'."
+            )
+    elif framework_clean == "tflite":
+        try:
+            import tensorflow as tf
+            raw_model = tf.lite.Interpreter(model_path=str(target_model_path))
+            raw_model.allocate_tensors()
+        except ImportError:
+            raise ModelLoadError(
+                f"Model '{target_model_path}' is a TFLite model, which requires 'tensorflow' or 'tflite-runtime'. "
+                f"Please install 'tflite-runtime' or 'tensorflow'."
+            )
+    elif framework_clean == "paddle":
+        try:
+            import paddle
+            raw_model = paddle.jit.load(str(target_model_path))
+        except ImportError:
+            raise ModelLoadError(
+                f"Model '{target_model_path}' is a PaddlePaddle model, which requires 'paddlepaddle'. "
+                f"Please install 'paddlepaddle'."
+            )
+    elif framework_clean == "mxnet":
+        raise UnsupportedModelError(
+            f"Model '{target_model_path}' is an Apache MXNet model. "
+            f"Apache MXNet reached end-of-life; please convert the model to ONNX."
+        )
     elif framework_clean == "jax":
         raise UnsupportedModelError(
             f"Model '{target_model_path}' is a JAX/Flax model. "
-            f"AdverScan currently supports PyTorch, Scikit-learn, and ONNX models."
+            f"AdverScan currently supports PyTorch, Scikit-learn, ONNX, and tree-based models."
         )
     elif framework_clean == "onnx":
         try:
@@ -375,6 +466,24 @@ def ingest_model(
             device=target_device,
             processor=processor,
             data_domain=domain_clean,
+        )
+    elif framework_clean in ("xgboost", "lightgbm", "catboost") or any(
+        k in raw_model.__class__.__name__.lower() for k in ("xgb", "lgb", "catboost", "booster")
+    ):
+        adapter = TreeModelAdapter(
+            raw_model,
+            device=target_device,
+            processor=processor,
+            data_domain=domain_clean,
+            framework=framework_clean,
+        )
+    elif framework_clean in ("openvino", "tensorrt", "coreml", "tflite"):
+        adapter = DeploymentRuntimeAdapter(
+            raw_model,
+            device=target_device,
+            processor=processor,
+            data_domain=domain_clean,
+            runtime_name=framework_clean,
         )
     elif framework_clean == "huggingface":
         adapter = HuggingFaceAdapter(

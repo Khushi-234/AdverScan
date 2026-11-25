@@ -98,7 +98,10 @@ class ModelPresetRegistry:
             resolved_framework = framework
         elif is_local_file:
             resolved_framework = "sklearn" if p.suffix.lower() in (".joblib", ".pkl", ".pickle") else "pytorch_local"
-        elif detected_fw in ("sklearn", "keras", "tensorflow", "onnx", "jax"):
+        elif detected_fw in (
+            "sklearn", "keras", "tensorflow", "onnx", "jax",
+            "xgboost", "lightgbm", "catboost", "openvino", "tensorrt", "coreml", "tflite", "paddle", "mxnet",
+        ):
             resolved_framework = detected_fw
         elif detected_source == "huggingface":
             resolved_framework = "huggingface"
