@@ -25,7 +25,7 @@ from app.ingestion.exceptions import (
     UnsupportedTaskError,
 )
 from app.ingestion.loader.base_loader import BaseModelLoader
-from app.ingestion.loader.huggingface_loader import HuggingFaceLoader
+from app.ingestion.loader.huggingface_loader import HuggingFaceLoader, load_keras_or_savedmodel
 from app.ingestion.loader.pytorch_loader import PyTorchLoader
 from app.ingestion.loader.sklearn_loader import SklearnLoader
 from app.ingestion.metadata.model_metadata import ModelMetadata
@@ -229,58 +229,19 @@ def ingest_model(
         )
     elif framework_clean in ("keras", "tensorflow"):
         try:
-            import tensorflow as tf
             from huggingface_hub import snapshot_download
             p = Path(target_model_path)
             local_dir = str(p) if p.exists() else snapshot_download(target_model_path)
-            raw_model = tf.keras.models.load_model(local_dir)
+            raw_model = load_keras_or_savedmodel(local_dir)
         except ImportError:
             raise ModelLoadError(
                 f"Model '{target_model_path}' is a TensorFlow/Keras model ('{runtime_metadata.framework}'), "
                 f"which requires the 'tensorflow' package. TensorFlow is not installed in the current environment. "
                 f"Please install 'tensorflow' to ingest and evaluate TensorFlow/Keras models."
             )
-    elif framework_clean == "xgboost":
-        try:
-            import xgboost as xgb
-            p = Path(target_model_path)
-            if p.is_file():
-                raw_model = xgb.Booster()
-                raw_model.load_model(str(p))
-            else:
-                raw_model = target_model_path
-        except ImportError:
-            raise ModelLoadError(
-                f"Model '{target_model_path}' is an XGBoost model, which requires the 'xgboost' package. "
-                f"xgboost is not installed in the current environment. Please install 'xgboost'."
-            )
-    elif framework_clean == "lightgbm":
-        try:
-            import lightgbm as lgb
-            p = Path(target_model_path)
-            if p.is_file():
-                raw_model = lgb.Booster(model_file=str(p))
-            else:
-                raw_model = target_model_path
-        except ImportError:
-            raise ModelLoadError(
-                f"Model '{target_model_path}' is a LightGBM model, which requires the 'lightgbm' package. "
-                f"lightgbm is not installed in the current environment. Please install 'lightgbm'."
-            )
-    elif framework_clean == "catboost":
-        try:
-            import catboost as cb
-            p = Path(target_model_path)
-            if p.is_file():
-                raw_model = cb.CatBoostClassifier()
-                raw_model.load_model(str(p))
-            else:
-                raw_model = target_model_path
-        except ImportError:
-            raise ModelLoadError(
-                f"Model '{target_model_path}' is a CatBoost model, which requires the 'catboost' package. "
-                f"catboost is not installed in the current environment. Please install 'catboost'."
-            )
+    elif framework_clean in ("xgboost", "lightgbm", "catboost"):
+        from app.ingestion.loader.tree_loader import TreeModelLoader
+        raw_model = TreeModelLoader().load(target_model_path, framework=framework_clean)
     elif framework_clean == "openvino":
         try:
             import openvino.runtime as ov
@@ -453,15 +414,18 @@ def ingest_model(
             data_domain=domain_clean,
         )
         runtime_metadata.extra_info["preprocessing"] = SklearnLoader.inspect_preprocessing(raw_model)
+        bundle_info = getattr(raw_model, "_bundle_info", None)
+        if isinstance(bundle_info, dict):
+            runtime_metadata.extra_info["bundle_info"] = bundle_info
+            if bundle_info.get("feature_names"):
+                runtime_metadata.extra_info["feature_names"] = bundle_info["feature_names"]
+                if isinstance(processor, TabularProcessor) and not processor.feature_names:
+                    processor.feature_names = list(bundle_info["feature_names"])
+                    processor.num_features = len(bundle_info["feature_names"])
+            if bundle_info.get("classes") and runtime_metadata.num_classes is None:
+                runtime_metadata.num_classes = len(bundle_info["classes"])
     elif framework_clean == "onnx" or (hasattr(raw_model, "run") and hasattr(raw_model, "get_inputs")):
         adapter = ONNXAdapter(
-            raw_model,
-            device=target_device,
-            processor=processor,
-            data_domain=domain_clean,
-        )
-    elif framework_clean in ("keras", "tensorflow") or (not isinstance(raw_model, nn.Module) and hasattr(raw_model, "predict")):
-        adapter = KerasAdapter(
             raw_model,
             device=target_device,
             processor=processor,
@@ -470,12 +434,27 @@ def ingest_model(
     elif framework_clean in ("xgboost", "lightgbm", "catboost") or any(
         k in raw_model.__class__.__name__.lower() for k in ("xgb", "lgb", "catboost", "booster")
     ):
+        fw_resolved = "xgboost" if any(k in raw_model.__class__.__name__.lower() for k in ("xgb", "booster")) else framework_clean
         adapter = TreeModelAdapter(
             raw_model,
             device=target_device,
             processor=processor,
             data_domain=domain_clean,
-            framework=framework_clean,
+            framework=fw_resolved,
+            feature_names=getattr(raw_model, "feature_names", None),
+            raw_input_features=getattr(raw_model, "raw_input_features", None),
+            preprocessing_info=getattr(raw_model, "preprocessing_info", None),
+            calibrator_info=getattr(raw_model, "calibrator_info", None),
+            threshold=getattr(raw_model, "threshold", 0.5),
+        )
+    elif framework_clean in ("keras", "tensorflow") or any(
+        k in getattr(raw_model.__class__, "__module__", "").lower() for k in ("keras", "tensorflow")
+    ):
+        adapter = KerasAdapter(
+            raw_model,
+            device=target_device,
+            processor=processor,
+            data_domain=domain_clean,
         )
     elif framework_clean in ("openvino", "tensorrt", "coreml", "tflite"):
         adapter = DeploymentRuntimeAdapter(
@@ -529,6 +508,12 @@ def ingest_model(
                     n_feats = getattr(raw_model, "n_features_in_")
                 elif hasattr(raw_model, "feature_names_in_"):
                     n_feats = len(getattr(raw_model, "feature_names_in_"))
+                elif hasattr(raw_model, "feature_names") and raw_model.feature_names:
+                    n_feats = len(raw_model.feature_names)
+                elif hasattr(raw_model, "num_features") and callable(raw_model.num_features):
+                    n_feats = raw_model.num_features()
+                elif getattr(adapter, "feature_names", None):
+                    n_feats = len(adapter.feature_names)
                 elif config_dict.get("num_features"):
                     n_feats = config_dict["num_features"]
                 elif runtime_metadata.input_shape and len(runtime_metadata.input_shape) >= 1:
@@ -572,14 +557,15 @@ def ingest_model(
     output_shape = None
     num_classes = config_dict.get("num_classes")
 
-    if sample_input is not None:
-        if isinstance(sample_input, torch.Tensor):
-            input_shape = tuple(sample_input.shape)
-        elif hasattr(sample_input, "shape"):
-            input_shape = tuple(sample_input.shape)
+    effective_sample = sample_input if sample_input is not None else validation_sample
+    if effective_sample is not None:
+        if isinstance(effective_sample, torch.Tensor):
+            input_shape = tuple(effective_sample.shape)
+        elif hasattr(effective_sample, "shape"):
+            input_shape = tuple(effective_sample.shape)
         elif processor is not None:
             try:
-                proc_in = processor.process(sample_input)
+                proc_in = processor.process(effective_sample)
                 if hasattr(proc_in, "shape"):
                     input_shape = tuple(proc_in.shape)
                 elif isinstance(proc_in, dict):
@@ -590,15 +576,18 @@ def ingest_model(
             except Exception:
                 pass
 
-        out = adapter.predict(sample_input)
-        if isinstance(out, torch.Tensor):
-            output_shape = tuple(out.shape)
-            if len(output_shape) > 1:
-                num_classes = output_shape[-1]
-        elif isinstance(out, np.ndarray):
-            output_shape = tuple(out.shape)
-            if len(output_shape) > 1:
-                num_classes = output_shape[-1]
+        try:
+            out = adapter.predict(effective_sample)
+            if isinstance(out, torch.Tensor):
+                output_shape = tuple(out.shape)
+                if len(output_shape) > 1:
+                    num_classes = output_shape[-1]
+            elif isinstance(out, np.ndarray):
+                output_shape = tuple(out.shape)
+                if len(output_shape) > 1:
+                    num_classes = output_shape[-1]
+        except Exception:
+            pass
     elif config_dict.get("input_resolution") and domain_clean == "image":
         res = config_dict["input_resolution"]
         input_shape = (1, *res) if len(res) == 3 else (1, 3, *res)
@@ -624,6 +613,13 @@ def ingest_model(
         if seq_len is not None:
             input_shape = (1, num_ch, seq_len)
 
+    if input_shape is None and hasattr(raw_model, "_savedmodel_input_shape"):
+        input_shape = getattr(raw_model, "_savedmodel_input_shape")
+    if output_shape is None and hasattr(raw_model, "_savedmodel_output_shape"):
+        output_shape = getattr(raw_model, "_savedmodel_output_shape")
+        if num_classes is None and output_shape and len(output_shape) > 1:
+            num_classes = output_shape[-1]
+
     if domain_clean == "tabular" and isinstance(processor, TabularProcessor):
         runtime_metadata.tabular_metadata = processor.tabular_metadata
         runtime_metadata.extra_info["tabular_metadata"] = processor.tabular_metadata.to_dict()
@@ -638,6 +634,12 @@ def ingest_model(
     total_params = None
     trainable_params = None
     model_arch = raw_model.__class__.__name__ if hasattr(raw_model, "__class__") else None
+    if framework_clean == "xgboost":
+        model_arch = "XGBoost Gradient Boosted Trees"
+    elif framework_clean == "lightgbm":
+        model_arch = "LightGBM Gradient Boosted Trees"
+    elif framework_clean == "catboost":
+        model_arch = "CatBoost Classifier"
     if hasattr(raw_model, "parameters"):
         try:
             params_list = [p for p in raw_model.parameters() if hasattr(p, "numel")]

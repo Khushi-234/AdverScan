@@ -64,6 +64,6 @@ def test_patch_hf_config():
         }
     }
     patched = patch_hf_config(raw_config)
-    assert patched["id2label"]["43"] == "Unused"
-    assert patched["label2id"]["Unused"] == 43
+    assert patched["id2label"][43] == "Class 43"
+    assert patched["label2id"]["Class 43"] == 43
     assert patched["num_labels"] == 3

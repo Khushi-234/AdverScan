@@ -23,12 +23,24 @@ def patch_hf_config(cfg_dict: Dict[str, Any]) -> Dict[str, Any]:
     if "id2label" in cfg_dict and isinstance(cfg_dict["id2label"], dict):
         patched_id2label = {}
         for k, v in cfg_dict["id2label"].items():
-            str_key = str(k)
-            label_val = str(v) if v is not None else "Unused"
-            patched_id2label[str_key] = label_val
-        
+            try:
+                int_key = int(k)
+            except (TypeError, ValueError):
+                int_key = k
+            label_val = str(v).strip() if v is not None else ""
+            if not label_val or label_val.lower() == "none":
+                label_val = f"Class {int_key}"
+            if int_key in patched_id2label and patched_id2label[int_key] != label_val:
+                raise ValueError(
+                    f"Conflicting duplicate id2label key after integer conversion: "
+                    f"{int_key} ('{patched_id2label[int_key]}' vs '{label_val}')"
+                )
+            patched_id2label[int_key] = label_val
+
         cfg_dict["id2label"] = patched_id2label
-        cfg_dict["label2id"] = {v: int(k) for k, v in patched_id2label.items()}
+        cfg_dict["label2id"] = {
+            str(v): k for k, v in patched_id2label.items() if isinstance(k, int)
+        }
         cfg_dict["num_labels"] = len(patched_id2label)
 
     return cfg_dict

@@ -102,6 +102,11 @@ def check_model_compatibility(model: Any, metadata: AttackMetadata) -> None:
     raw_model = model.get_model() if isinstance(model, BaseModelAdapter) else model
 
     if metadata.requires_gradient or metadata.requires_model_weights:
+        if isinstance(model, BaseModelAdapter) and not model.capabilities.supports_gradients:
+            raise UnsupportedModelError(
+                f"Attack '{metadata.name}' requires gradient backpropagation (supports_gradients=True), "
+                f"which is unsupported by {model.__class__.__name__} ({type(raw_model).__name__})."
+            )
         if not isinstance(raw_model, nn.Module):
             # Check if model has callable and parameter support
             if not (callable(raw_model) and hasattr(raw_model, "parameters")):

@@ -7,6 +7,7 @@ from app.attack_engine.attacks.tabular.lowprofool import LowProFool
 from app.attack_engine.attacks.tabular.carlini_wagner import TabularCW
 from app.attack_engine.attacks.tabular.jsma import TabularJSMA
 from app.attack_engine.attacks.tabular.vae_attack import VAEAttack
+from app.attack_engine.attacks.tabular.blackbox_query import TabularBlackBoxAttack
 
 __all__ = [
     "CapPGD",
@@ -14,4 +15,5 @@ __all__ = [
     "TabularCW",
     "TabularJSMA",
     "VAEAttack",
+    "TabularBlackBoxAttack",
 ]

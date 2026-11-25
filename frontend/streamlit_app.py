@@ -51,6 +51,7 @@ from frontend.services.attack_service import (
     execute_configured_attack,
     get_class_labels_mapping,
     get_compatible_attacks,
+    get_unsupported_attacks,
 )
 from frontend.services.defense_service import (
     execute_configured_defense,
@@ -58,7 +59,9 @@ from frontend.services.defense_service import (
 )
 from frontend.services.ingestion_service import (
     get_available_presets,
+    get_dataset_population_info,
     get_dataset_total_samples,
+    inspect_model_summary,
     load_model_and_dataset,
 )
 from app.ingestion.utils.model_utils import detect_model_domain
@@ -91,6 +94,7 @@ from frontend.services.xai_service import (
     TECHNIQUE_DISPLAY_NAMES,
 )
 from frontend.utils.session_state import (
+    clear_active_assessment,
     get_active_assessment,
     get_active_scan_id,
     get_attack_result,
@@ -297,6 +301,14 @@ elif stage == "ingestion":
         default_dataset = selected_preset_info.get("dataset_name", "")
         default_domain = selected_preset_info.get("data_domain", "image")
         default_framework = selected_preset_info.get("framework", "huggingface")
+        model_state_key = f"preset::{model_identifier.strip()}"
+
+        if st.session_state.get("_last_ingestion_selection") != model_state_key:
+            clear_active_assessment()
+            st.session_state["_last_ingestion_selection"] = model_state_key
+            st.session_state["_ingestion_status"] = "idle"
+            st.session_state["_ingestion_error"] = None
+            st.session_state["_requires_pickle_consent_for"] = None
 
         st.caption(
             f"**Preset Description**: {selected_preset_info.get('description', '')} • **Domain**: {DATA_DOMAIN_LABELS.get(default_domain, default_domain.capitalize())}"
@@ -309,13 +321,23 @@ elif stage == "ingestion":
             placeholder="e.g. bazyl/gtsrb-model, google/vit-base-patch16-224, distilbert-base-uncased",
             help="Hugging Face model repository identifier",
         )
-        detected_dom = detect_model_domain(model_identifier.strip()) if model_identifier.strip() else "unknown"
+        clean_hf_id = model_identifier.strip()
+        model_state_key = f"hf::{clean_hf_id}"
+        if st.session_state.get("_last_ingestion_selection") != model_state_key:
+            clear_active_assessment()
+            st.session_state["_last_ingestion_selection"] = model_state_key
+            st.session_state["_ingestion_status"] = "idle"
+            st.session_state["_ingestion_error"] = None
+            st.session_state["_requires_pickle_consent_for"] = None
+
+        detected_dom = detect_model_domain(clean_hf_id) if clean_hf_id else "unknown"
         dom_idx = DATA_DOMAIN_OPTIONS.index(detected_dom) if detected_dom in DATA_DOMAIN_OPTIONS else 0
 
         default_domain = st.selectbox(
             "Data Domain",
             options=DATA_DOMAIN_OPTIONS,
             index=dom_idx,
+            key=f"hf_domain::{model_state_key}",
             format_func=lambda d: DATA_DOMAIN_LABELS.get(d, d.capitalize()),
             help="Select the data domain representation expected by this model.",
         )
@@ -334,7 +356,7 @@ elif stage == "ingestion":
                 unsafe_allow_html=True,
             )
         st.caption(f"ℹ️ **Supported Architectures**: {DATA_DOMAIN_DESCRIPTIONS.get(default_domain, '')}")
-        default_framework = "huggingface"
+        default_framework = "auto"
 
     else:  # Local Model Path
         model_identifier = st.text_input(
@@ -343,7 +365,16 @@ elif stage == "ingestion":
             placeholder="e.g. models/classifier.pth or models/tabular-mlp-adult-census.pt",
             help="Path to pre-trained model file on local disk",
         )
-        detected_dom = detect_model_domain(model_identifier.strip()) if model_identifier.strip() else "unknown"
+        clean_local_id = model_identifier.strip()
+        model_state_key = f"local::{clean_local_id}"
+        if st.session_state.get("_last_ingestion_selection") != model_state_key:
+            clear_active_assessment()
+            st.session_state["_last_ingestion_selection"] = model_state_key
+            st.session_state["_ingestion_status"] = "idle"
+            st.session_state["_ingestion_error"] = None
+            st.session_state["_requires_pickle_consent_for"] = None
+
+        detected_dom = detect_model_domain(clean_local_id) if clean_local_id else "unknown"
         dom_idx = DATA_DOMAIN_OPTIONS.index(detected_dom) if detected_dom in DATA_DOMAIN_OPTIONS else 2
 
         col_dom, col_fw = st.columns([1, 1])
@@ -352,6 +383,7 @@ elif stage == "ingestion":
                 "Data Domain",
                 options=DATA_DOMAIN_OPTIONS,
                 index=dom_idx,
+                key=f"local_domain::{model_state_key}",
                 format_func=lambda d: DATA_DOMAIN_LABELS.get(d, d.capitalize()),
                 help="Select the data domain representation expected by this model.",
             )
@@ -374,10 +406,64 @@ elif stage == "ingestion":
         with col_fw:
             default_framework = st.selectbox(
                 "Framework",
-                ["pytorch", "sklearn"],
+                ["auto", "pytorch", "sklearn", "xgboost", "lightgbm", "catboost", "onnx"],
                 index=0,
-                format_func=lambda fw: "🔥 PyTorch (.pt, .pth)" if fw == "pytorch" else "⚙️ Scikit-Learn (.pkl, .joblib)",
+                key=f"local_fw::{model_state_key}",
+                format_func=lambda fw: {
+                    "auto": "⚡ Auto-Detect (Recommended)",
+                    "pytorch": "🔥 PyTorch (.pt, .pth, .safetensors)",
+                    "sklearn": "⚙️ Scikit-Learn (.pkl, .joblib)",
+                    "xgboost": "🌲 XGBoost (.json, .ubj, .model)",
+                    "lightgbm": "💡 LightGBM (.txt, .model)",
+                    "catboost": "🐱 CatBoost (.cbm)",
+                    "onnx": "📦 ONNX (.onnx)",
+                }.get(fw, fw),
+                help="Execution framework. Auto-detect inspects model weights dynamically.",
             )
+
+    # Informational auto-detected model summary card
+    summary_info = inspect_model_summary(model_identifier.strip()) if model_identifier.strip() else {}
+    if summary_info and summary_info.get("status") != "Ready":
+        st.markdown(
+            f"""
+            <div style="background: rgba(30, 41, 59, 0.5); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px; padding: 10px 14px; margin-top: 6px; margin-bottom: 12px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <span style="font-size: 0.8rem; font-weight: 700; color: var(--text-secondary); text-transform: uppercase;">
+                        🔍 Auto-Detected Model Artifact Information
+                    </span>
+                    <span class="badge-status badge-cyan">{summary_info.get('status', 'Detected')}</span>
+                </div>
+                <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; font-size: 0.82rem;">
+                    <div><span style="color: var(--text-secondary);">Framework:</span> <strong>{summary_info.get('framework', 'Auto')}</strong></div>
+                    <div><span style="color: var(--text-secondary);">Format:</span> <code>{summary_info.get('format', 'Auto')}</code></div>
+                    <div><span style="color: var(--text-secondary);">Architecture:</span> <strong>{summary_info.get('architecture', 'Standard')}</strong></div>
+                    <div><span style="color: var(--text-secondary);">Task:</span> <strong>{str(summary_info.get('task', 'Classification')).capitalize()}</strong></div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # Explicit security consent for pickle/joblib deserialization (never implicit)
+    requires_pickle_consent = (
+        bool(summary_info.get("requires_pickle_consent"))
+        or (default_framework == "sklearn")
+        or (st.session_state.get("_requires_pickle_consent_for") == model_state_key)
+    )
+    if requires_pickle_consent:
+        st.warning(
+            "⚠️ **Security Warning — Pickle / Joblib Deserialization**: "
+            "This model uses Python `pickle`/`joblib` serialization. "
+            "Deserializing an untrusted artifact can execute arbitrary code on your system. "
+            "Verify the repository or file source before enabling deserialization."
+        )
+        unsafe_allow_pickle_consent = st.checkbox(
+            "I verify the model source and explicitly consent to unsafe pickle/joblib deserialization (unsafe_allow_pickle=True)",
+            value=False,
+            key=f"pickle_consent::{model_state_key}",
+        )
+    else:
+        unsafe_allow_pickle_consent = False
 
     col_data, col_sample = st.columns([1, 1])
 
@@ -385,86 +471,133 @@ elif stage == "ingestion":
         dataset_input = st.text_input(
             "Dataset Identifier or Path",
             value=default_dataset,
-            placeholder="e.g. bazyl/GTSRB, data/adult_census_test.csv, or test split",
-            help="Dataset name or path to load evaluation samples from",
+            key=f"dataset_input::{model_state_key}",
+            placeholder="e.g. bazyl/GTSRB, data/adult_census_test.csv, or Hugging Face dataset ID",
+            help="Dataset name, Hugging Face dataset ID, or local file path to load evaluation samples from",
         )
 
         effective_dataset = dataset_input.strip() if dataset_input.strip() else default_dataset
-        total_avail_samples = get_dataset_total_samples(
+        pop_info = get_dataset_population_info(
             dataset_name=effective_dataset,
             data_domain=default_domain,
             model_identifier=model_identifier,
         )
-        half_samples = max(1, total_avail_samples // 2)
+        dataset_is_resolved = bool(pop_info.get("resolved"))
+        total_avail_samples = int(pop_info.get("total_samples") or 0)
+        half_samples = max(1, total_avail_samples // 2) if total_avail_samples > 0 else 0
         full_samples = total_avail_samples
 
-        st.markdown(
-            f"""
-            <div style="background: rgba(6, 182, 212, 0.08); border: 1px solid rgba(6, 182, 212, 0.25); border-radius: 8px; padding: 10px 14px; margin-top: 6px;">
-                <div style="display: flex; justify-content: space-between; align-items: center;">
-                    <span style="font-size: 0.84rem; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">
-                        📦 Dataset Population in Model/Benchmark
-                    </span>
-                    <span class="badge-status badge-cyan">{default_domain.upper()}</span>
+        if dataset_is_resolved and total_avail_samples > 0:
+            st.markdown(
+                f"""
+                <div style="background: rgba(6, 182, 212, 0.08); border: 1px solid rgba(6, 182, 212, 0.25); border-radius: 8px; padding: 10px 14px; margin-top: 6px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-size: 0.84rem; font-weight: 600; color: var(--text-secondary); text-transform: uppercase;">
+                            📦 Dataset Population in Model/Benchmark
+                        </span>
+                        <span class="badge-status badge-cyan">{default_domain.upper()} • REAL DATA</span>
+                    </div>
+                    <div style="font-size: 1.35rem; font-weight: 700; color: var(--stat-val-cyan); margin: 4px 0;">
+                        {total_avail_samples:,} <span style="font-size: 0.9rem; font-weight: 500; color: var(--text-secondary);">Total Samples Present</span>
+                    </div>
+                    <div style="font-size: 0.8rem; color: var(--text-secondary);">
+                        Provenance: <code>{pop_info.get('provenance')}</code> • Half split: <strong>{half_samples:,}</strong> • Full split: <strong>{full_samples:,}</strong>
+                    </div>
                 </div>
-                <div style="font-size: 1.35rem; font-weight: 700; color: var(--stat-val-cyan); margin: 4px 0;">
-                    {total_avail_samples:,} <span style="font-size: 0.9rem; font-weight: 500; color: var(--text-secondary);">Total Samples Present</span>
+                """,
+                unsafe_allow_html=True,
+            )
+            use_synthetic_explicit = False
+        else:
+            st.markdown(
+                f"""
+                <div style="background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 8px; padding: 10px 14px; margin-top: 6px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-size: 0.84rem; font-weight: 600; color: #f59e0b; text-transform: uppercase;">
+                            ⚠️ No Evaluation Dataset Resolved
+                        </span>
+                        <span class="badge-status badge-amber">0 REAL SAMPLES</span>
+                    </div>
+                    <div style="font-size: 0.82rem; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">
+                        This model has no associated real evaluation dataset. Provide a CSV/Parquet file path, Hugging Face dataset ID, or upload a dataset above.
+                    </div>
                 </div>
-                <div style="font-size: 0.8rem; color: var(--text-secondary);">
-                    Resolved source: <code>{effective_dataset}</code> • Half split: <strong>{half_samples:,}</strong> • Full split: <strong>{full_samples:,}</strong>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+                """,
+                unsafe_allow_html=True,
+            )
+            use_synthetic_explicit = st.checkbox(
+                "Explicitly generate synthetic smoke-test data (for pipeline verification only — NOT valid for empirical ASR/robustness)",
+                value=False,
+                key=f"explicit_synthetic::{model_state_key}",
+            )
 
     with col_sample:
-        sample_choice = st.radio(
-            "Evaluation Sample Population",
-            [
-                "Custom Number of Samples",
-                f"Half Dataset (50% • {half_samples:,} samples)",
-                f"Full Dataset (100% • {full_samples:,} samples)",
-            ],
-            index=0,
-            help="Select a custom sample batch, half (50%) of the benchmark, or the complete dataset (100%)",
-        )
+        if dataset_is_resolved and total_avail_samples > 0:
+            sample_choice = st.radio(
+                "Evaluation Sample Population",
+                [
+                    "Custom Number of Samples",
+                    f"Half Dataset (50% • {half_samples:,} samples)",
+                    f"Full Dataset (100% • {full_samples:,} samples)",
+                ],
+                index=0,
+                key=f"sample_choice::{model_state_key}",
+                help="Select a custom sample batch, half (50%) of the benchmark, or the complete dataset (100%)",
+            )
 
-        if sample_choice.startswith("Half Dataset"):
-            sample_size = half_samples
-            st.markdown(
-                f'<div style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.25); border-radius: 8px; padding: 10px 14px; margin-top: 6px;">'
-                f'<div style="font-weight: 700; color: var(--stat-val-emerald); font-size: 0.95rem;">⚡ Half Dataset Mode Selected</div>'
-                f'<div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 4px; line-height: 1.4;">'
-                f'Evaluating <strong>{sample_size:,}</strong> samples (50.0% coverage of {total_avail_samples:,} total samples).'
-                f'</div></div>',
-                unsafe_allow_html=True,
-            )
-        elif sample_choice.startswith("Full Dataset"):
-            sample_size = full_samples
-            warning_msg = ""
-            if full_samples > 1000 and default_domain in ("image", "vision"):
-                warning_msg = f"<div style='font-size: 0.78rem; color: #f59e0b; margin-top: 4px;'>⚠️ Note: Ingesting {sample_size:,} vision tensors will run gradient backpropagation across all images.</div>"
-            st.markdown(
-                f'<div style="background: rgba(139, 92, 246, 0.08); border: 1px solid rgba(139, 92, 246, 0.25); border-radius: 8px; padding: 10px 14px; margin-top: 6px;">'
-                f'<div style="font-weight: 700; color: #8b5cf6; font-size: 0.95rem;">🚀 Full Dataset Mode Selected</div>'
-                f'<div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 4px; line-height: 1.4;">'
-                f'Evaluating all <strong>{sample_size:,}</strong> samples (100.0% full benchmark coverage).'
-                f'{warning_msg}</div></div>',
-                unsafe_allow_html=True,
-            )
-        else:
+            if sample_choice.startswith("Half Dataset"):
+                sample_size = half_samples
+                st.markdown(
+                    f'<div style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.25); border-radius: 8px; padding: 10px 14px; margin-top: 6px;">'
+                    f'<div style="font-weight: 700; color: var(--stat-val-emerald); font-size: 0.95rem;">⚡ Half Dataset Mode Selected</div>'
+                    f'<div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 4px; line-height: 1.4;">'
+                    f'Evaluating <strong>{sample_size:,}</strong> samples (50.0% coverage of {total_avail_samples:,} total samples).'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+            elif sample_choice.startswith("Full Dataset"):
+                sample_size = full_samples
+                warning_msg = ""
+                if full_samples > 1000 and default_domain in ("image", "vision"):
+                    warning_msg = f"<div style='font-size: 0.78rem; color: #f59e0b; margin-top: 4px;'>⚠️ Note: Ingesting {sample_size:,} vision tensors will run gradient backpropagation across all images.</div>"
+                st.markdown(
+                    f'<div style="background: rgba(139, 92, 246, 0.08); border: 1px solid rgba(139, 92, 246, 0.25); border-radius: 8px; padding: 10px 14px; margin-top: 6px;">'
+                    f'<div style="font-weight: 700; color: #8b5cf6; font-size: 0.95rem;">🚀 Full Dataset Mode Selected</div>'
+                    f'<div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 4px; line-height: 1.4;">'
+                    f'Evaluating all <strong>{sample_size:,}</strong> samples (100.0% full benchmark coverage).'
+                    f'{warning_msg}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                sample_size = st.number_input(
+                    "Evaluation Samples (Batch Size)",
+                    min_value=1,
+                    max_value=max(1, total_avail_samples),
+                    value=min(5, total_avail_samples),
+                    step=1,
+                    key=f"sample_size::{model_state_key}",
+                    help=f"Number of samples to load into memory for evaluation (1 to {total_avail_samples:,})",
+                )
+                pct_cov = (sample_size / max(1, total_avail_samples)) * 100.0
+                st.caption(
+                    f"Selected: **{sample_size:,}** of **{total_avail_samples:,}** samples (**{pct_cov:.1f}%** dataset coverage)"
+                )
+        elif use_synthetic_explicit:
             sample_size = st.number_input(
-                "Evaluation Samples (Batch Size)",
+                "Synthetic Smoke-Test Samples",
                 min_value=1,
-                max_value=max(100, total_avail_samples),
-                value=min(5, total_avail_samples),
+                max_value=50,
+                value=5,
                 step=1,
-                help=f"Number of samples to load into memory for evaluation (1 to {total_avail_samples:,})",
+                key=f"sample_size_synth::{model_state_key}",
+                help="Synthetic smoke-test sample count (explicitly marked synthetic)",
             )
-            pct_cov = (sample_size / max(1, total_avail_samples)) * 100.0
-            st.caption(
-                f"Selected: **{sample_size:,}** of **{total_avail_samples:,}** samples (**{pct_cov:.1f}%** dataset coverage)"
+            st.warning("⚠️ Synthetic smoke-test mode active. These samples are NOT real benchmark data.")
+        else:
+            sample_size = 5
+            st.info(
+                "ℹ️ **Model-Only Ingestion Mode**: No evaluation dataset is selected. "
+                "AdverScan will ingest and validate the model, then ask you to supply a dataset before running empirical attacks."
             )
 
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
@@ -486,6 +619,12 @@ elif stage == "ingestion":
         if not model_identifier.strip():
             st.error("Please provide a valid model identifier or path.")
         else:
+            req_id = int(st.session_state.get("_ingestion_request_id", 0)) + 1
+            st.session_state["_ingestion_request_id"] = req_id
+            st.session_state["_ingestion_status"] = "loading"
+            st.session_state["_ingestion_error"] = None
+            clear_active_assessment()
+
             progress_bar = st.progress(
                 0, text="Initializing model ingestion environment..."
             )
@@ -493,37 +632,48 @@ elif stage == "ingestion":
 
             try:
                 progress_bar.progress(
-                    20,
-                    text="Validating model identifier and resolving framework adapter...",
+                    15,
+                    text="Step 1/5: Resolving model source and inspecting repository artifacts...",
                 )
-                time.sleep(0.08)
+                time.sleep(0.06)
 
                 progress_bar.progress(
-                    45,
-                    text="Loading model architecture and introspecting parameter tensors...",
+                    35,
+                    text="Step 2/5: Detecting framework and loading serialized model weights...",
                 )
+                time.sleep(0.06)
+
+                progress_bar.progress(
+                    60,
+                    text="Step 3/5: Resolving preprocessing, calibration, and prediction adapter...",
+                )
+
                 res_data = load_model_and_dataset(
                     model_identifier=model_identifier,
-                    dataset_name=dataset_input if dataset_input.strip() else None,
+                    dataset_name=(dataset_input.strip() if dataset_input.strip() else None),
                     data_domain=default_domain,
                     framework=default_framework,
                     device=device_opt,
                     sample_size=sample_size,
+                    unsafe_allow_pickle=bool(unsafe_allow_pickle_consent),
+                    force_refresh=True,
+                    allow_synthetic_fallback=bool(use_synthetic_explicit),
                 )
 
                 progress_bar.progress(
-                    75,
-                    text="Loading dataset split and constructing evaluation tensor batches...",
+                    85,
+                    text="Step 4/5: Running safe forward pass smoke test and resolving dataset...",
                 )
-                time.sleep(0.08)
+                time.sleep(0.06)
 
-                progress_bar.progress(
-                    90,
-                    text="Computing parameter statistics, model size, and tensor shapes...",
-                )
-                time.sleep(0.08)
+                if st.session_state.get("_ingestion_request_id") != req_id or res_data.get("model_identifier") != model_identifier.strip():
+                    progress_bar.empty()
+                    st.stop()
 
+                res_data["request_id"] = req_id
                 set_active_assessment(res_data)
+                st.session_state["_ingestion_status"] = "success"
+                st.session_state["_ingestion_error"] = None
 
                 # Initialize persistent SQLite record for this assessment run
                 try:
@@ -634,11 +784,19 @@ elif stage == "ingestion":
                 )
             except Exception as err:
                 progress_bar.empty()
-                st.error(f"❌ Ingestion Error: {str(err)}")
+                clear_active_assessment()
+                st.session_state["_ingestion_status"] = "failed"
+                st.session_state["_ingestion_error"] = str(err)
+                if "unsafe_allow_pickle" in str(err) or "Security risk:" in str(err):
+                    st.session_state["_requires_pickle_consent_for"] = model_state_key
+                    st.rerun()
 
-    # Display confirmed active model details if loaded
+    if st.session_state.get("_ingestion_status") == "failed" and st.session_state.get("_ingestion_error"):
+        st.error(f"❌ Ingestion Error: {st.session_state.get('_ingestion_error')}")
+
+    # Display confirmed active model details if loaded and matching current selection
     active_data = get_active_assessment()
-    if active_data:
+    if active_data and active_data.get("model_identifier") == model_identifier.strip():
         st.markdown("---")
         st.markdown(
             """
@@ -765,6 +923,13 @@ elif stage == "ingestion":
             tot_ds_samples = active_data.get("total_dataset_samples") or meta.get("Total Dataset Samples") or meta.get("total_dataset_samples")
             tot_samples_str = f"{tot_ds_samples:,} samples" if isinstance(tot_ds_samples, int) else (f"{tot_ds_samples}" if tot_ds_samples else "Available")
             cov_pct_str = f"({(samples_eval / tot_ds_samples * 100):.1f}% coverage)" if isinstance(tot_ds_samples, int) and tot_ds_samples > 0 else ""
+            orig_fc = active_data.get("original_feature_count") or meta.get("original_feature_count")
+            proc_fc = active_data.get("processed_feature_count") or meta.get("processed_feature_count")
+            feat_counts_line = (
+                f"<br>• <strong>Feature Counts:</strong> {orig_fc} original &rarr; {proc_fc} processed"
+                if orig_fc is not None and proc_fc is not None
+                else ""
+            )
             st.markdown(
                 f"""
                 <div class="modern-card card-accent-violet">
@@ -776,7 +941,7 @@ elif stage == "ingestion":
                         • <strong>Dataset Identifier:</strong> {dataset_ident}<br>
                         • <strong>Dataset Population:</strong> {tot_samples_str}<br>
                         • <strong>Evaluated Samples:</strong> {samples_eval} samples {cov_pct_str}<br>
-                        • <strong>Batch Tensor Shape:</strong> {tensor_shape}<br>
+                        • <strong>Batch Tensor Shape:</strong> {tensor_shape}{feat_counts_line}<br>
                         • <strong>Ingestion Wall Time:</strong> {ingest_disp}
                     </div>
                 </div>
@@ -789,8 +954,15 @@ elif stage == "ingestion":
             st.error(
                 f"🚨 **CRITICAL WARNING — SYNTHETIC FALLBACK DATA IN USE**\n\n"
                 f"**Failure Reason:** `{fallback_reason_msg}`\n\n"
-                f"**Data Provenance:** The requested real evaluation dataset was unavailable. Randomly generated synthetic samples matching the model's discovered input dimensions are currently populated.\n\n"
-                f"**Methodological Impact:** Any subsequent attack evaluations, robustness scores, or ASR percentages will reflect synthetic random distribution and **must NOT** be presented or reported as authentic empirical model evaluations."
+                f"**Data Provenance:** Randomly generated synthetic smoke-test samples are populated by explicit user opt-in.\n\n"
+                f"**Methodological Impact:** Synthetic samples **must NOT** be used to claim authentic empirical robustness or ASR results."
+            )
+        elif active_data and not active_data.get("dataset_resolved", True):
+            reason_msg = active_data.get("dataset_fallback_reason") or "No evaluation dataset is associated with this model."
+            st.warning(
+                f"⚠️ **Model Ingested Successfully — Evaluation Dataset Required**\n\n"
+                f"{reason_msg}\n\n"
+                f"Please enter a local CSV/Parquet path, a Hugging Face dataset ID, or upload an evaluation dataset above and re-run ingestion to proceed with empirical evaluation."
             )
 
         st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
@@ -798,6 +970,7 @@ elif stage == "ingestion":
             "Proceed to Attack Discovery & Configuration →",
             type="primary",
             use_container_width=True,
+            disabled=bool(active_data and not active_data.get("dataset_resolved", True)),
         ):
             set_workflow_stage("attack_config")
             st.rerun()
@@ -824,19 +997,19 @@ elif stage == "attack_config":
             st.rerun()
         st.stop()
 
-    # Synthetic fallback alert (A05)
-    synthetic_confirmed = True
-    if active_data.get("is_synthetic_dataset"):
-        fallback_reason_msg = active_data.get("dataset_fallback_reason") or "Real dataset could not be loaded"
+    # Empirical attack evaluation guard (Requirement 8 & 9: Require real evaluation dataset)
+    missing_real_dataset = (
+        not active_data.get("dataset_resolved")
+        or active_data.get("is_synthetic_dataset")
+        or active_data.get("test_inputs") is None
+    )
+    if missing_real_dataset:
+        fallback_reason_msg = active_data.get("dataset_fallback_reason") or "No real evaluation dataset is loaded"
         st.error(
-            f"🚨 **Operating on Synthetic Fallback Data**\n\n"
-            f"**Failure Reason:** `{fallback_reason_msg}`\n\n"
-            f"**Notice:** No real benchmark dataset is loaded. Adversarial perturbations will be computed against synthetic data."
-        )
-        synthetic_confirmed = st.checkbox(
-            "I acknowledge that evaluation is running on synthetic data and should only be used for pipeline testing.",
-            value=False,
-            key="confirm_synthetic_eval",
+            f"🚫 **Empirical Attack Evaluation Blocked — No Real Evaluation Dataset Loaded**\n\n"
+            f"**Reason:** `{fallback_reason_msg}`\n\n"
+            f"**Policy:** AdverScan does **not** calculate or report empirical ASR or robustness metrics without a real evaluation dataset (or on synthetic smoke-test data). "
+            f"Please return to **Model Ingestion** and provide a CSV/Parquet file, Hugging Face dataset ID, or upload a dataset."
         )
 
     model_adapter = active_data["adapter"]
@@ -924,6 +1097,17 @@ elif stage == "attack_config":
         compatible_attacks = get_compatible_attacks(
             model=model_adapter, data_domain=domain
         )
+        unsupported_attacks = get_unsupported_attacks(
+            model=model_adapter, data_domain=domain
+        )
+
+    if unsupported_attacks:
+        with st.expander(
+            f"ℹ️ {len(unsupported_attacks)} attack(s) excluded due to model capability constraints",
+            expanded=False,
+        ):
+            for u in unsupported_attacks:
+                st.caption(f"• **{u['name']}** (`{u['id']}`): {u['reason']}")
 
     if not compatible_attacks:
         st.warning(
@@ -1638,7 +1822,7 @@ elif stage == "attack_config":
             "Execute Adversarial Attack ⚡",
             type="primary",
             use_container_width=True,
-            disabled=(not valid_params) or (active_data.get("is_synthetic_dataset") and not synthetic_confirmed),
+            disabled=(not valid_params) or bool(missing_real_dataset),
         )
 
     if run_btn and valid_params:
@@ -1804,12 +1988,16 @@ elif stage == "attack_results":
 
     active_data = get_active_assessment() or {}
 
-    # Synthetic fallback alert (A05)
+    # Synthetic fallback guard (Requirement 8)
     if active_data.get("is_synthetic_dataset"):
-        st.warning(
-            "⚠️ **Notice: Evaluation executed on Synthetic Fallback Data.** "
-            "This experiment reflects model behavior on generated synthetic samples, not a real dataset benchmark."
+        st.error(
+            "🚫 **Empirical Attack Metrics Unavailable on Synthetic Smoke-Test Data.** "
+            "No real evaluation dataset was resolved for this model. Supply a valid evaluation dataset in Model Ingestion to compute authentic ASR and robustness scores."
         )
+        if st.button("← Return to Model Ingestion", type="primary"):
+            set_workflow_stage("ingestion")
+            st.rerun()
+        st.stop()
 
     asr_raw_in = result.get("asr_percentage")
     if asr_raw_in is None:

@@ -81,6 +81,15 @@ class KerasAdapter(BaseModelAdapter):
             out = self._model.predict(x_in, verbose=0) if "verbose" not in kwargs else self._model.predict(x_in, **kwargs)
         else:
             out = self._model(x_in, training=False)
+        if isinstance(out, dict):
+            for key in ("logits", "predictions", "output_0"):
+                if key in out:
+                    out = out[key]
+                    break
+            else:
+                out = next(iter(out.values()))
+        if hasattr(out, "numpy"):
+            out = out.numpy()
         out_np = np.asarray(out)
         if return_numpy:
             return out_np

@@ -215,13 +215,23 @@ class ModelPresetRegistry:
         num_classes = None
 
         try:
-            from transformers import AutoConfig
+            from transformers import AutoConfig, CONFIG_MAPPING
+            from huggingface_hub import hf_hub_download
+            from app.ingestion.loader.huggingface_loader import patch_hf_config
+            import json
             try:
                 cfg = AutoConfig.from_pretrained(clean_input, local_files_only=True)
             except Exception:
                 if "/" in clean_input:
                     try:
-                        cfg = AutoConfig.from_pretrained(clean_input)
+                        cfg_path = hf_hub_download(clean_input, "config.json")
+                        with open(cfg_path, "r", encoding="utf-8") as f:
+                            raw_cfg = patch_hf_config(json.load(f))
+                        m_type_raw = raw_cfg.get("model_type", "")
+                        if m_type_raw and m_type_raw in CONFIG_MAPPING:
+                            cfg = CONFIG_MAPPING[m_type_raw].from_dict(raw_cfg)
+                        else:
+                            cfg = AutoConfig.from_pretrained(clean_input)
                     except Exception:
                         cfg = None
                 else:

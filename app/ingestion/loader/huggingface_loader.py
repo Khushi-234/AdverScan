@@ -12,6 +12,8 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoModel,
     AutoConfig,
+    CONFIG_MAPPING,
+    PretrainedConfig,
     ViTConfig,
 )
 
@@ -19,15 +21,98 @@ from app.ingestion.exceptions import ModelLoadError, UnsupportedTaskError
 from app.ingestion.loader.base_loader import BaseModelLoader
 
 
+def load_keras_or_savedmodel(local_path: str) -> Any:
+    """Load a Keras (.keras/.h5) file or TensorFlow SavedModel directory (Keras 2 & 3 compatible)."""
+    import tensorflow as tf
+    from pathlib import Path
+
+    p = Path(local_path)
+    if p.is_file():
+        return tf.keras.models.load_model(str(p))
+
+    if p.is_dir():
+        for ext in ("*.keras", "*.h5", "*.hdf5"):
+            matches = sorted(p.glob(ext))
+            if matches:
+                return tf.keras.models.load_model(str(matches[0]))
+
+    try:
+        return tf.keras.models.load_model(str(p))
+    except ValueError as exc:
+        if not (p.is_dir() and (p / "saved_model.pb").exists()):
+            raise exc
+
+        import keras
+
+        saved = tf.saved_model.load(str(p))
+        sigs = getattr(saved, "signatures", {}) or {}
+        call_endpoint = "serving_default" if "serving_default" in sigs else (next(iter(sigs.keys()), "serving_default"))
+        layer = keras.layers.TFSMLayer(str(p), call_endpoint=call_endpoint)
+
+        sig = sigs.get(call_endpoint)
+        if sig is not None:
+            try:
+                _, kw_spec = sig.structured_input_signature
+                first_spec = next(iter(kw_spec.values()), None) if isinstance(kw_spec, dict) else None
+                if first_spec is not None and hasattr(first_spec, "shape"):
+                    dims = [1 if d is None else int(d) for d in first_spec.shape.as_list()]
+                    layer._savedmodel_input_shape = tuple(dims)
+            except Exception:
+                pass
+            try:
+                out_specs = sig.structured_outputs
+                first_out = next(iter(out_specs.values()), None) if isinstance(out_specs, dict) else out_specs
+                if first_out is not None and hasattr(first_out, "shape"):
+                    dims = [1 if d is None else int(d) for d in first_out.shape.as_list()]
+                    layer._savedmodel_output_shape = tuple(dims)
+            except Exception:
+                pass
+        return layer
+
+
 def patch_hf_config(cfg_dict: dict) -> dict:
     """Normalize and patch id2label/label2id dictionaries in Hugging Face configs."""
+    if not isinstance(cfg_dict, dict):
+        return cfg_dict
+
     if "id2label" in cfg_dict and isinstance(cfg_dict["id2label"], dict):
-        cfg_dict["id2label"] = {
-            str(k): (str(v) if v is not None else "Unused")
-            for k, v in cfg_dict["id2label"].items()
+        normalized_id2label = {}
+        for k, v in cfg_dict["id2label"].items():
+            try:
+                int_key = int(k)
+            except (TypeError, ValueError):
+                int_key = k
+            label_str = str(v).strip() if v is not None else ""
+            if not label_str or label_str.lower() == "none":
+                label_str = f"Class {int_key}"
+            if int_key in normalized_id2label and normalized_id2label[int_key] != label_str:
+                raise ValueError(
+                    f"Conflicting duplicate id2label key after integer conversion: "
+                    f"{int_key} ('{normalized_id2label[int_key]}' vs '{label_str}')"
+                )
+            normalized_id2label[int_key] = label_str
+
+        cfg_dict["id2label"] = normalized_id2label
+        cfg_dict["label2id"] = {
+            str(label): idx for idx, label in normalized_id2label.items() if isinstance(idx, int)
         }
-        cfg_dict["label2id"] = {v: int(k) for k, v in cfg_dict["id2label"].items()}
-        cfg_dict["num_labels"] = len(cfg_dict["id2label"])
+        cfg_dict["num_labels"] = len(normalized_id2label)
+    elif "label2id" in cfg_dict and isinstance(cfg_dict["label2id"], dict):
+        normalized_label2id = {}
+        for label, idx in cfg_dict["label2id"].items():
+            try:
+                int_idx = int(idx)
+            except (TypeError, ValueError):
+                continue
+            label_str = str(label).strip() if label is not None else ""
+            if not label_str or label_str.lower() == "none":
+                label_str = f"Class {int_idx}"
+            normalized_label2id[label_str] = int_idx
+        cfg_dict["label2id"] = normalized_label2id
+        cfg_dict["id2label"] = {idx: label for label, idx in normalized_label2id.items()}
+        if normalized_label2id:
+            cfg_dict["num_labels"] = len(normalized_label2id)
+
     return cfg_dict
 
 
@@ -106,6 +191,10 @@ class HuggingFaceLoader(BaseModelLoader):
                 f"Available files: {hf_info.get('files', [])}"
             )
 
+        if hf_info.get("framework") in ("xgboost", "lightgbm", "catboost"):
+            from app.ingestion.loader.tree_loader import TreeModelLoader
+            return TreeModelLoader().load(model_id, framework=hf_info.get("framework"), **kwargs)
+
         if hf_info.get("framework") == "sklearn":
             from app.ingestion.loader.sklearn_loader import SklearnLoader
             allow_pickle = kwargs.pop("unsafe_allow_pickle", False)
@@ -113,10 +202,9 @@ class HuggingFaceLoader(BaseModelLoader):
 
         if hf_info.get("framework") in ("keras", "tensorflow"):
             try:
-                import tensorflow as tf
                 from huggingface_hub import snapshot_download
                 local_dir = snapshot_download(model_id)
-                return tf.keras.models.load_model(local_dir)
+                return load_keras_or_savedmodel(local_dir)
             except ImportError:
                 raise ModelLoadError(
                     f"Hugging Face repository '{model_id}' contains a TensorFlow/Keras SavedModel, "
@@ -127,7 +215,6 @@ class HuggingFaceLoader(BaseModelLoader):
         if hf_info.get("framework") == "onnx":
             try:
                 import onnxruntime
-                from huggingface_hub import hf_hub_download
                 onnx_file = hf_info.get("model_file") or next(
                     (f for f in hf_info.get("files", []) if f.endswith(".onnx")), None
                 )
@@ -154,6 +241,9 @@ class HuggingFaceLoader(BaseModelLoader):
             )
 
         try:
+            # Remove loader-specific kwargs unsupported by Hugging Face AutoModel.from_pretrained
+            kwargs.pop("unsafe_allow_pickle", None)
+
             # 1. Download/read config.json to perform config patching and task verification
             model_config = None
             cfg_dict = {}
@@ -161,13 +251,24 @@ class HuggingFaceLoader(BaseModelLoader):
                 config_path = hf_hub_download(model_id, "config.json")
                 with open(config_path, "r", encoding="utf-8") as f:
                     cfg_dict = json.load(f)
-                
-                cfg_dict = patch_hf_config(cfg_dict)
+
+                try:
+                    cfg_dict = patch_hf_config(cfg_dict)
+                except ValueError as ve:
+                    raise ModelLoadError(f"Invalid Hugging Face config for '{model_id}': {ve}") from ve
+
                 model_type = cfg_dict.get("model_type", "")
-                if model_type == "vit":
+                if model_type and model_type in CONFIG_MAPPING:
+                    model_config = CONFIG_MAPPING[model_type].from_dict(cfg_dict)
+                elif model_type == "vit":
                     model_config = ViTConfig.from_dict(cfg_dict)
                 else:
-                    model_config = AutoConfig.from_pretrained(model_id)
+                    try:
+                        model_config = AutoConfig.from_pretrained(model_id)
+                    except Exception:
+                        model_config = PretrainedConfig.from_dict(cfg_dict)
+            except ModelLoadError:
+                raise
             except Exception:
                 try:
                     model_config = AutoConfig.from_pretrained(model_id)
@@ -231,7 +332,10 @@ class HuggingFaceLoader(BaseModelLoader):
                 except Exception as e:
                     last_exc = e
                     try:
-                        model = AutoModel.from_pretrained(model_id, trust_remote_code=True, **kwargs)
+                        auto_kwargs = {"trust_remote_code": True, **kwargs}
+                        if model_config is not None:
+                            auto_kwargs["config"] = model_config
+                        model = AutoModel.from_pretrained(model_id, **auto_kwargs)
                     except Exception as e2:
                         last_exc = e2
                         # Fallback for gliner2 AutoExtractor
@@ -254,7 +358,10 @@ class HuggingFaceLoader(BaseModelLoader):
                 except Exception as e:
                     last_exc = e
                     try:
-                        model = AutoModel.from_pretrained(model_id, trust_remote_code=True, **kwargs)
+                        auto_kwargs = {"trust_remote_code": True, **kwargs}
+                        if model_config is not None:
+                            auto_kwargs["config"] = model_config
+                        model = AutoModel.from_pretrained(model_id, **auto_kwargs)
                     except Exception as e2:
                         last_exc = e2
                         model = None

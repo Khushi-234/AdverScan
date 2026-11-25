@@ -158,6 +158,14 @@ CANONICAL_DOMAIN_CATALOG: Dict[str, List[Dict[str, str]]] = {
     ],
     "tabular": [
         {
+            "id": "tabular_blackbox",
+            "name": "Tabular Black-Box Query",
+            "full_name": "Constraint-Aware Black-Box Tabular Attack",
+            "category": "Black-Box / Query-Based",
+            "threat_model": "Black-Box",
+            "description": "Gradient-free query-based perturbation attack compatible with XGBoost, LightGBM, CatBoost, Scikit-learn, and neural tabular models.",
+        },
+        {
             "id": "cap_pgd",
             "name": "CapPGD",
             "full_name": "Constraint-Aware Projected Gradient Descent",
@@ -318,6 +326,46 @@ def get_compatible_attacks(
             )
 
     return compatible_attacks
+
+
+def get_unsupported_attacks(
+    model: Any, data_domain: str = "image"
+) -> List[Dict[str, str]]:
+    """
+    Return canonical domain attacks that are incompatible with the target model,
+    along with an explicit reason (e.g. requires gradients).
+    """
+    discover_attacks()
+    clean_domain = data_domain.strip().lower().replace("-", "_")
+    if clean_domain in ("timeseries", "sequence"):
+        clean_domain = "time-series"
+    elif clean_domain in ("vision",):
+        clean_domain = "image"
+    elif clean_domain in ("nlp",):
+        clean_domain = "text"
+    elif clean_domain in ("csv",):
+        clean_domain = "tabular"
+
+    unsupported: List[Dict[str, str]] = []
+    for item in CANONICAL_DOMAIN_CATALOG.get(clean_domain, []):
+        atk_id = item["id"]
+        try:
+            attack_cls = get_attack(atk_id)
+            meta: Optional[AttackMetadata] = getattr(attack_cls, "metadata", None)
+            if meta is None:
+                continue
+            check_model_compatibility(model, meta)
+        except (UnsupportedModelError, AttackConfigurationError) as exc:
+            unsupported.append(
+                {
+                    "id": atk_id,
+                    "name": item["name"],
+                    "reason": str(exc),
+                }
+            )
+        except Exception:
+            continue
+    return unsupported
 
 
 def get_class_labels_mapping(

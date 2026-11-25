@@ -106,6 +106,9 @@ class SklearnLoader(BaseModelLoader):
                 with open(path, "rb") as f:
                     loaded_obj = pickle.load(f)
 
+            if isinstance(loaded_obj, dict):
+                loaded_obj = self._extract_estimator_from_bundle(loaded_obj, path)
+
             if not (hasattr(loaded_obj, "predict") and (hasattr(loaded_obj, "fit") or hasattr(loaded_obj, "classes_"))):
                 raise ModelLoadError(
                     f"Deserialized object from '{path}' is of type {type(loaded_obj)}, "
@@ -118,6 +121,66 @@ class SklearnLoader(BaseModelLoader):
             raise
         except Exception as e:
             raise ModelLoadError(f"Failed to load scikit-learn model from {path}: {str(e)}") from e
+
+    @staticmethod
+    def _extract_estimator_from_bundle(bundle: dict, path: Union[str, Path]) -> Any:
+        """
+        Validate and extract an actual scikit-learn estimator/pipeline from a dictionary bundle,
+        preserving preprocessing, feature ordering, thresholds, class labels, and metadata.
+        """
+        est = None
+        est_key = None
+        for key in ("pipeline", "model", "estimator", "classifier", "clf", "regressor"):
+            cand = bundle.get(key)
+            if cand is not None and hasattr(cand, "predict") and (hasattr(cand, "fit") or hasattr(cand, "classes_")):
+                est = cand
+                est_key = key
+                break
+
+        if est is None:
+            raise ModelLoadError(
+                f"Dictionary bundle from '{path}' (keys: {list(bundle.keys())}) does not contain a valid "
+                f"scikit-learn estimator or pipeline with predict()."
+            )
+
+        # Attach external scaler/preprocessor if present and estimator is not already a Pipeline
+        preproc = bundle.get("preprocessor") or bundle.get("scaler")
+        if preproc is not None and hasattr(preproc, "transform") and not hasattr(est, "steps"):
+            try:
+                from sklearn.pipeline import Pipeline
+                est = Pipeline([("preprocessor", preproc), ("estimator", est)])
+            except Exception:
+                pass
+
+        feat_names = (
+            bundle.get("feature_names")
+            or bundle.get("features")
+            or bundle.get("columns")
+            or getattr(est, "feature_names_in_", None)
+        )
+        if feat_names is not None:
+            feat_names = [str(f) for f in feat_names]
+
+        bundle_classes = bundle.get("classes") or bundle.get("class_names") or bundle.get("labels")
+        if bundle_classes is None and hasattr(est, "classes_"):
+            bundle_classes = list(getattr(est, "classes_"))
+
+        bundle_meta = bundle.get("metadata") if isinstance(bundle.get("metadata"), dict) else {}
+        bundle_info = {
+            "source_key": est_key,
+            "raw_bundle_keys": list(bundle.keys()),
+            "feature_names": feat_names,
+            "threshold": bundle.get("threshold"),
+            "classes": bundle_classes,
+            "metadata": bundle_meta,
+        }
+        try:
+            est._bundle_info = bundle_info
+            if feat_names and not hasattr(est, "feature_names"):
+                est.feature_names = feat_names
+        except Exception:
+            pass
+        return est
 
     @staticmethod
     def inspect_preprocessing(model: Any) -> dict:

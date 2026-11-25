@@ -232,6 +232,36 @@ def get_report_result() -> Optional[Any]:
     return st.session_state.get("_latest_report_result")
 
 
+def clear_active_assessment() -> None:
+    """Clear active assessment and downstream results when model source/ID changes or ingestion fails."""
+    init_session_state()
+    for key in (
+        "is_assessment_active",
+        "active_scan_id",
+        "active_model_name",
+        "active_model_domain",
+        "active_model_framework",
+        "active_metadata_dict",
+        "active_attack_name",
+        "active_defense_name",
+        "active_xai_technique",
+        "last_error",
+        "_active_assessment_data",
+        "_active_adapter",
+        "_active_model",
+        "_active_metadata",
+        "_test_inputs",
+        "_test_labels",
+        "_latest_attack_result",
+        "_latest_vulnerability_result",
+        "_latest_xai_result",
+        "_latest_defense_result",
+        "_latest_defense_xai_result",
+        "_latest_report_result",
+    ):
+        st.session_state[key] = DEFAULT_SESSION_STATE.get(key)
+
+
 def reset_workflow_state() -> None:
     """Reset the entire workflow back to the idle dashboard state."""
     init_session_state()

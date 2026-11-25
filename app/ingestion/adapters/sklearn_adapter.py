@@ -40,6 +40,16 @@ class SklearnAdapter(BaseModelAdapter):
         self.processor = processor
         self.data_domain = data_domain
 
+        bundle_info = getattr(model, "_bundle_info", None) or {}
+        self.feature_names = bundle_info.get("feature_names") or (
+            [str(c) for c in getattr(model, "feature_names_in_")]
+            if hasattr(model, "feature_names_in_")
+            else None
+        )
+        self.threshold = bundle_info.get("threshold")
+        self.class_labels = bundle_info.get("classes")
+        self.bundle_metadata = bundle_info.get("metadata", {})
+
     @property
     def capabilities(self) -> AdapterCapabilities:
         """
@@ -91,7 +101,12 @@ class SklearnAdapter(BaseModelAdapter):
         if isinstance(inputs, torch.Tensor):
             return inputs.detach().cpu().numpy()
         elif hasattr(inputs, "values") and hasattr(inputs, "columns"):
-            # pandas DataFrame
+            # pandas DataFrame — apply fitted tabular_preprocessor if attached, else enforce feature order
+            fitted_prep = getattr(self, "tabular_preprocessor", None)
+            if fitted_prep is not None and getattr(fitted_prep, "is_fitted", False):
+                return fitted_prep.transform(inputs)
+            if self.feature_names and set(self.feature_names).issubset(set(inputs.columns)):
+                return inputs[self.feature_names].values
             return inputs.values
         elif hasattr(inputs, "values") and not hasattr(inputs, "columns"):
             # pandas Series

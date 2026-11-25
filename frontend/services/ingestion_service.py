@@ -24,17 +24,122 @@ from app.ingestion.exceptions import (
     ModelIngestionError,
     ModelLoadError,
     ModelValidationError,
+    UnsafeModelError,
     UnsupportedDomainError,
     UnsupportedModelError,
     UnsupportedTaskError,
 )
 from app.ingestion.pipeline import IngestionResult, ingest_model
 from app.ingestion.presets import KNOWN_DATASET_SAMPLE_COUNTS, MODEL_PRESETS
+from app.ingestion.utils.model_utils import clear_hf_repo_cache
 
 
 def get_available_presets() -> Dict[str, Dict[str, Any]]:
     """Retrieve existing model presets configured in the backend."""
     return MODEL_PRESETS
+
+
+def inspect_model_summary(model_identifier: str) -> Dict[str, Any]:
+    """
+    Fast informational inspection of a model source (Hugging Face ID, local path, or preset)
+    for frontend display prior to full ingestion.
+    """
+    clean_id = str(model_identifier or "").strip()
+    if not clean_id:
+        return {}
+
+    # 1. Preset check
+    if clean_id in MODEL_PRESETS:
+        p = MODEL_PRESETS[clean_id]
+        return {
+            "model_id": clean_id,
+            "framework": p.get("framework", "pytorch").upper(),
+            "domain": p.get("data_domain", "image"),
+            "architecture": p.get("model_type", "Preset Benchmark Model"),
+            "task": p.get("task_type", "classification"),
+            "format": "Built-in Preset",
+            "features_count": p.get("num_features"),
+            "num_classes": p.get("num_classes"),
+            "artifacts": ["Built-in PyTorch weights", "Built-in Benchmark dataset"],
+            "status": "Ready for Ingestion",
+        }
+
+    # 2. Local path
+    p = Path(clean_id)
+    if p.exists():
+        from app.ingestion.utils.model_utils import detect_model_domain, detect_model_framework
+        fw = detect_model_framework(clean_id)
+        dom = detect_model_domain(clean_id)
+        return {
+            "model_id": clean_id,
+            "framework": fw.upper(),
+            "domain": dom,
+            "architecture": f"{fw.capitalize()} Model Checkpoint",
+            "task": "classification",
+            "format": p.suffix or "Directory",
+            "model_file": p.name,
+            "requires_pickle_consent": p.suffix.lower() in (".joblib", ".pkl", ".pickle"),
+            "features_count": None,
+            "num_classes": None,
+            "artifacts": [p.name],
+            "status": "Local file resolved",
+        }
+
+    # 3. Hugging Face repository
+    if "/" in clean_id and not clean_id.startswith((".", "/")):
+        try:
+            from app.ingestion.utils.model_utils import detect_hf_repo_info
+            hf_info = detect_hf_repo_info(clean_id)
+            fw = hf_info.get("framework", "unknown")
+            dom = hf_info.get("domain", "unknown")
+            fmt = hf_info.get("model_file") or "unknown"
+            arch = hf_info.get("architecture") or f"{fw.capitalize()} Model"
+            task = hf_info.get("task_type", "classification")
+            feats = hf_info.get("num_features")
+            raw_feats = len(hf_info.get("raw_feature_names") or [])
+            arts = []
+            if hf_info.get("model_file"):
+                arts.append(hf_info["model_file"])
+            arts.extend(hf_info.get("preprocessing_files", []))
+            arts.extend(hf_info.get("calibration_files", []))
+            arts.extend(hf_info.get("metadata_files", []))
+
+            status_str = "Model weights and artifacts identified" if hf_info.get("is_model_repo") else "Inspecting repository..."
+            return {
+                "model_id": clean_id,
+                "framework": fw.upper() if fw != "unknown" else "Auto-Detecting",
+                "domain": dom,
+                "architecture": arch,
+                "task": task,
+                "format": Path(fmt).suffix if fmt != "unknown" else "Repository",
+                "model_file": hf_info.get("model_file"),
+                "requires_pickle_consent": (
+                    fw == "sklearn"
+                    or any(
+                        str(w).lower().endswith((".joblib", ".pkl", ".pickle"))
+                        for w in (hf_info.get("weight_files") or ([fmt] if fmt != "unknown" else []))
+                    )
+                ),
+                "features_count": feats or (raw_feats if raw_feats > 0 else None),
+                "num_classes": None,
+                "artifacts": arts or hf_info.get("files", [])[:5],
+                "status": status_str,
+            }
+        except Exception:
+            pass
+
+    return {
+        "model_id": clean_id,
+        "framework": "Auto-Detecting",
+        "domain": "unknown",
+        "architecture": "Auto-Detecting",
+        "task": "classification",
+        "format": "Auto-Detecting",
+        "features_count": None,
+        "num_classes": None,
+        "artifacts": [],
+        "status": "Ready",
+    }
 
 
 def get_dataset_total_samples(
@@ -100,7 +205,7 @@ def get_dataset_total_samples(
     except Exception:
         pass
 
-    # 5. Fallback defaults by domain
+    # 5. Fallback defaults by domain (only for legacy get_dataset_total_samples callers)
     clean_domain = str(data_domain or "").strip().lower()
     if clean_domain in ("tabular", "csv"):
         return 250
@@ -111,6 +216,143 @@ def get_dataset_total_samples(
     return 1000
 
 
+def get_dataset_population_info(
+    dataset_name: Optional[str] = None,
+    data_domain: Optional[str] = "image",
+    model_identifier: Optional[str] = None,
+    uploaded_df: Optional[pd.DataFrame] = None,
+    uploaded_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Resolve actual dataset population metadata from genuine sources only.
+    Never invents a 250-sample fallback when no dataset is present.
+    """
+    if uploaded_df is not None:
+        n_rows = int(len(uploaded_df))
+        return {
+            "total_samples": n_rows,
+            "resolved": n_rows > 0,
+            "source_type": "uploaded",
+            "resolved_source": uploaded_name or "Uploaded Dataset",
+            "provenance": f"User-uploaded dataset ({uploaded_name or 'DataFrame'}) • {n_rows:,} rows",
+        }
+
+    _model_exts = (".pt", ".pth", ".ckpt", ".bin", ".safetensors", ".pkl", ".pickle", ".joblib", ".onnx", ".ubj", ".cbm", ".h5", ".hdf5", ".keras", ".tflite", ".xml", ".engine", ".plan", ".mlmodel")
+    clean_ds = str(dataset_name or "").strip()
+    clean_ds_lower = clean_ds.lower()
+    is_placeholder = (
+        not clean_ds
+        or clean_ds_lower in ("custom_dataset", "evaluation-dataset", "none")
+        or clean_ds_lower.endswith(_model_exts)
+        or (model_identifier and clean_ds == str(model_identifier).strip())
+    )
+
+    # 1. Explicit dataset in KNOWN_DATASET_SAMPLE_COUNTS
+    if not is_placeholder:
+        if clean_ds_lower in KNOWN_DATASET_SAMPLE_COUNTS:
+            n = int(KNOWN_DATASET_SAMPLE_COUNTS[clean_ds_lower])
+            return {
+                "total_samples": n,
+                "resolved": True,
+                "source_type": "preset",
+                "resolved_source": clean_ds,
+                "provenance": f"Benchmark dataset '{clean_ds}'",
+            }
+        for k, v in KNOWN_DATASET_SAMPLE_COUNTS.items():
+            if k.lower() == clean_ds_lower or k.lower().endswith("/" + clean_ds_lower) or clean_ds_lower.endswith("/" + k.lower()):
+                return {
+                    "total_samples": int(v),
+                    "resolved": True,
+                    "source_type": "preset",
+                    "resolved_source": clean_ds,
+                    "provenance": f"Benchmark dataset '{clean_ds}'",
+                }
+
+    # 2. Model preset lookup
+    if model_identifier and model_identifier in MODEL_PRESETS:
+        preset_ds = str(MODEL_PRESETS[model_identifier].get("dataset_name", "")).strip()
+        preset_ds_lower = preset_ds.lower()
+        if preset_ds_lower in KNOWN_DATASET_SAMPLE_COUNTS:
+            n = int(KNOWN_DATASET_SAMPLE_COUNTS[preset_ds_lower])
+            return {
+                "total_samples": n,
+                "resolved": True,
+                "source_type": "preset",
+                "resolved_source": preset_ds,
+                "provenance": f"Preset benchmark dataset '{preset_ds}'",
+            }
+        for k, v in KNOWN_DATASET_SAMPLE_COUNTS.items():
+            if k.lower() == preset_ds_lower or k.lower().endswith("/" + preset_ds_lower) or preset_ds_lower.endswith("/" + k.lower()):
+                return {
+                    "total_samples": int(v),
+                    "resolved": True,
+                    "source_type": "preset",
+                    "resolved_source": preset_ds,
+                    "provenance": f"Preset benchmark dataset '{preset_ds}'",
+                }
+
+    # 3. Check local disk or HF repository bundled dataset
+    try:
+        resolved = None
+        if not is_placeholder:
+            resolved = resolve_dataset_file(
+                identifier=clean_ds,
+                candidate_extensions=[".csv", ".tsv", ".parquet", ".pt", ".pth", ".npy", ".jsonl"],
+                model_identifier=None,
+            )
+        elif str(data_domain or "").strip().lower() in ("tabular", "csv", "table") and model_identifier:
+            from app.evaluation.dataset_loader.factory import resolve_tabular_dataset_source
+            resolved = resolve_tabular_dataset_source(
+                dataset_name=None if is_placeholder else clean_ds,
+                model_id=str(model_identifier).strip(),
+            )
+
+        if isinstance(resolved, pd.DataFrame):
+            n = int(len(resolved))
+            return {
+                "total_samples": n,
+                "resolved": n > 0,
+                "source_type": "hf_dataset",
+                "resolved_source": clean_ds if not is_placeholder else str(model_identifier),
+                "provenance": f"Resolved DataFrame ({n:,} rows)",
+            }
+        if resolved and Path(str(resolved)).is_file():
+            p = Path(str(resolved))
+            n = 0
+            if p.suffix.lower() in (".csv", ".tsv"):
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    n = max(0, sum(1 for _ in f) - 1)
+            elif p.suffix.lower() == ".parquet":
+                n = int(len(pd.read_parquet(p)))
+            elif p.suffix.lower() in (".pt", ".pth"):
+                obj = torch.load(p, weights_only=False, map_location="cpu")
+                if isinstance(obj, dict):
+                    for key in ("inputs", "data", "x", "samples", "features"):
+                        if key in obj and hasattr(obj[key], "shape") and len(obj[key].shape) > 0:
+                            n = int(obj[key].shape[0])
+                            break
+                elif hasattr(obj, "shape") and len(obj.shape) > 0:
+                    n = int(obj.shape[0])
+            if n > 0:
+                return {
+                    "total_samples": n,
+                    "resolved": True,
+                    "source_type": "local_file",
+                    "resolved_source": str(p),
+                    "provenance": f"Local file '{p.name}' ({n:,} rows)",
+                }
+    except Exception:
+        pass
+
+    return {
+        "total_samples": 0,
+        "resolved": False,
+        "source_type": "none",
+        "resolved_source": None,
+        "provenance": "No evaluation dataset resolved",
+    }
+
+
 def load_model_and_dataset(
     model_identifier: Any,
     dataset_name: Optional[str] = None,
@@ -118,6 +360,10 @@ def load_model_and_dataset(
     framework: Optional[str] = None,
     device: Optional[str] = None,
     sample_size: int = 10,
+    unsafe_allow_pickle: bool = False,
+    force_refresh: bool = True,
+    dataset_data: Optional[Any] = None,
+    allow_synthetic_fallback: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Ingest a model using the existing backend pipeline, extract complete telemetry,
@@ -146,8 +392,17 @@ def load_model_and_dataset(
         else getattr(model_identifier, "__name__", type(model_identifier).__name__)
     )
 
-    # Determine execution device
+    # Determine execution device and framework
     exec_device = device if device and device != "Auto-detect" else None
+    exec_framework = (
+        None
+        if (not framework or str(framework).lower().strip() in ("auto", "auto-detect", "auto-detect (recommended)", "none"))
+        else framework
+    )
+
+    # Clear cached HF repo metadata on fresh ingestion requests so retries/switches never use stale metadata
+    if force_refresh and isinstance(model_identifier, str):
+        clear_hf_repo_cache(clean_id)
 
     # Step 1: Ingest model using existing backend ingestion pipeline and measure time
     t0 = time.time()
@@ -156,14 +411,16 @@ def load_model_and_dataset(
             model_path=model_identifier,
             dataset_name=dataset_name,
             data_domain=data_domain,
-            framework=framework,
+            framework=exec_framework,
             device=exec_device,
+            unsafe_allow_pickle=bool(unsafe_allow_pickle),
         )
     except (
         ModelLoadError,
         ModelValidationError,
         ConfigurationError,
         DatasetFormatError,
+        UnsafeModelError,
         UnsupportedDomainError,
         UnsupportedModelError,
         UnsupportedTaskError,
@@ -274,42 +531,115 @@ def load_model_and_dataset(
         device_name = "CPU"
 
     # Step 4: Load a sample evaluation batch using existing dataset loader factory
+    # NEVER treat model_identifier / model filename as a dataset source.
     test_inputs: Optional[torch.Tensor] = None
     test_labels: Optional[torch.Tensor] = None
     is_synthetic_dataset = False
+    dataset_resolved = False
     fallback_reason: Optional[str] = None
-    resolved_dataset = dataset_name or metadata.dataset_name or clean_id
+    explicit_dataset_requested = bool(
+        dataset_data is not None
+        or (isinstance(dataset_name, str) and dataset_name.strip() and dataset_name.strip().lower() not in ("custom_dataset", "evaluation-dataset", "none"))
+    )
 
+    meta_ds = getattr(metadata, "dataset_name", None)
+    if meta_ds and str(meta_ds).strip().lower() in ("custom_dataset", "evaluation-dataset", "none", ""):
+        meta_ds = None
+    resolved_dataset = (
+        dataset_name.strip()
+        if isinstance(dataset_name, str) and dataset_name.strip()
+        else None
+    ) or meta_ds
+
+    # Extract model feature schema & preprocessing metadata for compatible tabular dataset resolution
+    model_feature_names = (
+        getattr(adapter, "feature_names", None)
+        or getattr(raw_model, "feature_names", None)
+        or (getattr(metadata, "extra_info", {}) or {}).get("feature_names")
+    )
+    model_raw_features = (
+        getattr(adapter, "raw_input_features", None)
+        or getattr(raw_model, "raw_input_features", None)
+        or (getattr(metadata, "extra_info", {}) or {}).get("raw_feature_names")
+    )
+    model_preprocessing = (
+        getattr(adapter, "preprocessing_info", None)
+        or getattr(raw_model, "preprocessing_info", None)
+    )
+    expected_num_features = None
+    if model_feature_names:
+        expected_num_features = len(model_feature_names)
+    elif hasattr(raw_model, "num_features") and callable(raw_model.num_features):
+        expected_num_features = int(raw_model.num_features())
+    elif hasattr(raw_model, "n_features_in_"):
+        expected_num_features = int(getattr(raw_model, "n_features_in_"))
+    elif getattr(metadata, "input_shape", None) and len(metadata.input_shape) >= 1:
+        expected_num_features = int(metadata.input_shape[-1])
+
+    loader = None
     try:
-        loader = get_dataset_loader(
-            dataset_name=resolved_dataset,
-            data_domain=resolved_domain,
-            processor_name=metadata.processor_name or clean_id,
-            split=f"test[:{sample_size}]",
-            batch_size=sample_size,
-        )
+        if dataset_data is not None or resolved_dataset is not None or resolved_domain in ("tabular", "csv", "table"):
+            loader = get_dataset_loader(
+                dataset_name=resolved_dataset or "custom_tabular",
+                data_domain=resolved_domain,
+                processor_name=metadata.processor_name or clean_id,
+                split=f"test[:{sample_size}]",
+                batch_size=sample_size,
+                data=dataset_data,
+                model_id=clean_id,
+                feature_names=model_feature_names,
+                raw_input_features=model_raw_features,
+                preprocessing_info=model_preprocessing,
+                expected_num_features=expected_num_features,
+            )
 
-        for batch in loader.iterate_batches():
-            test_inputs = batch[0]
-            test_labels = batch[1]
-            break
+            for batch in loader.iterate_batches():
+                test_inputs = batch[0]
+                test_labels = batch[1]
+                break
+
+            if test_inputs is not None and test_labels is not None:
+                # Verify dataset compatibility with the model's prediction interface
+                try:
+                    sample_probe = test_inputs[:1] if hasattr(test_inputs, "__getitem__") else test_inputs
+                    _ = adapter.predict(sample_probe)
+                except Exception as compat_exc:
+                    raise DatasetFormatError(
+                        f"Loaded dataset is incompatible with model prediction interface: {compat_exc}"
+                    ) from compat_exc
+                dataset_resolved = True
+        else:
+            fallback_reason = (
+                f"No evaluation dataset is associated with model '{clean_id}'. "
+                f"Please select or upload a compatible evaluation dataset."
+            )
     except Exception as exc:
         fallback_reason = str(exc)
-        test_inputs, test_labels = _generate_domain_sample_batch(
-            metadata, sample_size, raw_model=raw_model, preset_info=preset_info
-        )
-        is_synthetic_dataset = True
+        # Case D: If user explicitly provided a dataset/file and it is incompatible or missing, fail cleanly (no synthetic fallback)
+        if explicit_dataset_requested and allow_synthetic_fallback is False:
+            if isinstance(exc, (DatasetFormatError, ValueError, ConfigurationError)):
+                raise DatasetFormatError(f"Dataset validation failed: {exc}") from exc
+            raise DatasetFormatError(f"Could not load specified dataset '{resolved_dataset}': {exc}") from exc
 
-    if test_inputs is None or test_labels is None:
-        if not fallback_reason:
-            fallback_reason = "Dataset loader returned empty batch"
-        test_inputs, test_labels = _generate_domain_sample_batch(
-            metadata, sample_size, raw_model=raw_model, preset_info=preset_info
-        )
-        is_synthetic_dataset = True
+    if not dataset_resolved:
+        if allow_synthetic_fallback is False:
+            # Case B: Keep model ingestion successful; do NOT silently generate synthetic evaluation data
+            test_inputs = None
+            test_labels = None
+            is_synthetic_dataset = False
+        else:
+            # Explicit synthetic fallback (Case E) or legacy caller compatibility
+            if not fallback_reason:
+                fallback_reason = "No real evaluation dataset resolved"
+            test_inputs, test_labels = _generate_domain_sample_batch(
+                metadata, sample_size, raw_model=raw_model, preset_info=preset_info
+            )
+            is_synthetic_dataset = True
 
-    actual_evaluated_samples = _get_input_sample_count(
-        test_inputs, default=sample_size
+    actual_evaluated_samples = (
+        _get_input_sample_count(test_inputs, default=sample_size)
+        if test_inputs is not None
+        else 0
     )
 
     # Class resolution
@@ -336,11 +666,12 @@ def load_model_and_dataset(
         else "Black-Box (Inference Only)"
     )
 
-    dataset_display_name = (
-        f"Synthetic Fallback Data ({resolved_dataset} failed)"
-        if is_synthetic_dataset
-        else resolved_dataset
-    )
+    if is_synthetic_dataset:
+        dataset_display_name = f"Synthetic Fallback Data ({resolved_dataset or clean_id} unavailable)"
+    elif dataset_resolved:
+        dataset_display_name = resolved_dataset or (getattr(loader, "dataset_name", None) or "Resolved Dataset")
+    else:
+        dataset_display_name = "No Evaluation Dataset Loaded"
 
     # Observed input tensor shape
     observed_input_shape, batch_shape_str = _get_input_shape_desc(test_inputs)
@@ -349,13 +680,35 @@ def load_model_and_dataset(
             preset_info.get("input_resolution") or metadata.input_shape or None
         )
 
-    total_dataset_samples = get_dataset_total_samples(
-        dataset_name=resolved_dataset,
-        data_domain=resolved_domain,
-        model_identifier=clean_id,
-    )
+    if dataset_resolved and loader is not None and hasattr(loader, "__len__"):
+        try:
+            total_dataset_samples = int(len(loader))
+        except Exception:
+            total_dataset_samples = actual_evaluated_samples
+    elif dataset_resolved:
+        pop_info = get_dataset_population_info(
+            dataset_name=resolved_dataset,
+            data_domain=resolved_domain,
+            model_identifier=clean_id,
+            uploaded_df=dataset_data if isinstance(dataset_data, pd.DataFrame) else None,
+        )
+        total_dataset_samples = int(pop_info["total_samples"]) if pop_info["resolved"] else actual_evaluated_samples
+    elif is_synthetic_dataset:
+        total_dataset_samples = actual_evaluated_samples
+    else:
+        total_dataset_samples = 0
 
     # Build rich telemetry contract (aligned with run_pipeline_for_multimodel.py)
+    fitted_prep = getattr(loader, "fitted_preprocessor", None) if loader is not None else None
+    if fitted_prep is not None and adapter is not None:
+        try:
+            adapter.tabular_preprocessor = fitted_prep
+        except Exception:
+            pass
+    orig_feat_count = getattr(loader, "original_feature_count", None) if loader is not None else None
+    proc_feat_count = getattr(loader, "processed_feature_count", None) if loader is not None else None
+    prep_summary = getattr(loader, "preprocessing_summary", None) if loader is not None else None
+
     telemetry = {
         "model_identifier": clean_id,
         "model_name": model_name,
@@ -373,9 +726,13 @@ def load_model_and_dataset(
         "ingestion_time": ingestion_time,
         "device": device_name,
         "dataset_name": dataset_display_name,
+        "dataset_resolved": dataset_resolved,
         "total_dataset_samples": total_dataset_samples,
         "is_synthetic_dataset": is_synthetic_dataset,
-        "dataset_source": "synthetic_fallback" if is_synthetic_dataset else "real_dataset",
+        "dataset_source": (
+            "synthetic_fallback" if is_synthetic_dataset
+            else ("real_dataset" if dataset_resolved else "none")
+        ),
         "dataset_fallback_reason": fallback_reason,
         "input_shape": (
             str(observed_input_shape)
@@ -384,6 +741,9 @@ def load_model_and_dataset(
         ),
         "batch_shape": batch_shape_str,
         "sample_count": actual_evaluated_samples,
+        "original_feature_count": orig_feat_count,
+        "processed_feature_count": proc_feat_count,
+        "preprocessing_summary": prep_summary,
         "gradient_access": gradient_access,
         "supports_gradients": supports_gradients,
     }
@@ -408,6 +768,7 @@ def load_model_and_dataset(
     }
 
     return {
+        "model_identifier": clean_id,
         "adapter": adapter,
         "raw_model": raw_model,
         "model": adapter or raw_model,
@@ -415,7 +776,11 @@ def load_model_and_dataset(
         "metadata_dict": metadata_dict,
         "telemetry": telemetry,
         "is_synthetic_dataset": is_synthetic_dataset,
-        "dataset_source": "synthetic_fallback" if is_synthetic_dataset else "real_dataset",
+        "dataset_resolved": dataset_resolved,
+        "dataset_source": (
+            "synthetic_fallback" if is_synthetic_dataset
+            else ("real_dataset" if dataset_resolved else "none")
+        ),
         "dataset_fallback_reason": fallback_reason,
         "total_parameters": total_params,
         "trainable_parameters": trainable_params,
@@ -425,6 +790,10 @@ def load_model_and_dataset(
         "num_classes": metadata_dict["Total Classes"],
         "input_shape": metadata_dict["Input Shape"],
         "batch_tensor_shape": batch_shape_str,
+        "original_feature_count": orig_feat_count,
+        "processed_feature_count": proc_feat_count,
+        "preprocessing_summary": prep_summary,
+        "tabular_preprocessor": fitted_prep,
         "sample_size": actual_evaluated_samples,
         "total_dataset_samples": total_dataset_samples,
         "device": device_name,
@@ -495,6 +864,10 @@ def _generate_domain_sample_batch(
                 num_features = getattr(raw_model, "n_features_in_")
             elif hasattr(raw_model, "feature_names_in_"):
                 num_features = len(getattr(raw_model, "feature_names_in_"))
+            elif hasattr(raw_model, "feature_names") and raw_model.feature_names:
+                num_features = len(raw_model.feature_names)
+            elif hasattr(raw_model, "num_features") and callable(raw_model.num_features):
+                num_features = raw_model.num_features()
             elif hasattr(raw_model, "n_features_"):
                 num_features = getattr(raw_model, "n_features_")
             elif hasattr(raw_model, "named_parameters"):
@@ -513,6 +886,10 @@ def _generate_domain_sample_batch(
             if num_features is None:
                 extra = getattr(metadata, "extra_info", {}) or {}
                 num_features = extra.get("num_features")
+                if num_features is None and extra.get("feature_names"):
+                    num_features = len(extra["feature_names"])
+                elif num_features is None and extra.get("raw_feature_names"):
+                    num_features = len(extra["raw_feature_names"])
 
         if num_features is None and preset_info:
             num_features = preset_info.get("num_features")
@@ -525,6 +902,8 @@ def _generate_domain_sample_batch(
             )
 
         num_features = int(num_features)
+        if num_classes is None or num_classes <= 0:
+            num_classes = 2
         inputs = torch.randn(sample_size, num_features)
         labels = torch.randint(0, num_classes, (sample_size,))
     elif domain in ("time-series", "timeseries", "sequence"):
