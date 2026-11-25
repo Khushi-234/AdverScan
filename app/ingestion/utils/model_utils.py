@@ -142,18 +142,299 @@ def detect_model_source(model_or_path: Any) -> str:
     return "local"
 
 
+_HF_REPO_INFO_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _parse_yaml_frontmatter(text: str) -> Dict[str, Any]:
+    """Extract simple key/value and list fields from README.md YAML frontmatter without requiring PyYAML."""
+    if not text or not text.startswith("---"):
+        return {}
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}
+    yaml_block = parts[1]
+    result: Dict[str, Any] = {}
+    current_key: Optional[str] = None
+    for raw_line in yaml_block.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("- ") and current_key:
+            val = line[2:].strip().strip("'\"")
+            existing = result.get(current_key)
+            if isinstance(existing, list):
+                existing.append(val)
+            else:
+                result[current_key] = [val]
+            continue
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k = k.strip()
+            v = v.strip().strip("'\"")
+            current_key = k
+            if v:
+                if v.startswith("[") and v.endswith("]"):
+                    result[k] = [x.strip().strip("'\"") for x in v[1:-1].split(",") if x.strip()]
+                else:
+                    result[k] = v
+            else:
+                result[k] = []
+    return result
+
+
+def detect_hf_repo_info(repo_id: str) -> Dict[str, Any]:
+    """
+    Inspect a Hugging Face repository's files, README.md/model card YAML metadata,
+    tags, and config.json.
+    Distinguishes model repositories from dataset, source-only, or incomplete repositories.
+    Uses caching to avoid repeated API calls.
+    """
+    clean_id = repo_id.strip()
+    if clean_id in _HF_REPO_INFO_CACHE:
+        return _HF_REPO_INFO_CACHE[clean_id]
+
+    res: Dict[str, Any] = {
+        "framework": "unknown",
+        "domain": "unknown",
+        "task_type": "classification",
+        "library_name": None,
+        "pipeline_tag": None,
+        "files": [],
+        "model_file": None,
+        "is_model_repo": False,
+        "repo_type": "unknown",
+        "error": None,
+    }
+
+    try:
+        from huggingface_hub import HfApi, hf_hub_download
+        api = HfApi()
+
+        # 1. Fetch file list
+        files: List[str] = []
+        try:
+            files = api.list_repo_files(clean_id)
+            res["files"] = files
+        except Exception as exc:
+            res["error"] = str(exc)
+            err_lower = str(exc).lower()
+            if "404" in err_lower or "401" in err_lower or "not found" in err_lower:
+                res["repo_type"] = "not_found"
+            files = []
+
+        # 2. Fetch model metadata / card data
+        tags: List[str] = []
+        card_data: Dict[str, Any] = {}
+        try:
+            info = api.model_info(clean_id)
+            res["library_name"] = getattr(info, "library_name", None)
+            res["pipeline_tag"] = getattr(info, "pipeline_tag", None)
+            tags = [t.lower() for t in (getattr(info, "tags", []) or [])]
+            raw_card = getattr(info, "card_data", None) or getattr(info, "cardData", None)
+            if isinstance(raw_card, dict):
+                card_data = raw_card
+            elif hasattr(raw_card, "to_dict"):
+                card_data = raw_card.to_dict() or {}
+        except Exception:
+            info = None
+
+        # Inspect README.md YAML frontmatter if metadata is missing
+        if (not res["library_name"] or not res["pipeline_tag"]) and any(f.lower() == "readme.md" for f in files):
+            try:
+                readme_name = next(f for f in files if f.lower() == "readme.md")
+                readme_path = hf_hub_download(clean_id, readme_name)
+                with open(readme_path, "r", encoding="utf-8", errors="ignore") as f:
+                    yaml_meta = _parse_yaml_frontmatter(f.read(8192))
+                if not res["library_name"] and yaml_meta.get("library_name"):
+                    res["library_name"] = str(yaml_meta["library_name"])
+                if not res["pipeline_tag"] and yaml_meta.get("pipeline_tag"):
+                    res["pipeline_tag"] = str(yaml_meta["pipeline_tag"])
+                if isinstance(yaml_meta.get("tags"), list):
+                    for t in yaml_meta["tags"]:
+                        if str(t).lower() not in tags:
+                            tags.append(str(t).lower())
+            except Exception:
+                pass
+
+        # Inspect config.json if present
+        cfg_data: Dict[str, Any] = {}
+        if "config.json" in files:
+            try:
+                cfg_path = hf_hub_download(clean_id, "config.json")
+                with open(cfg_path, "r", encoding="utf-8", errors="ignore") as f:
+                    loaded_cfg = json.load(f)
+                if isinstance(loaded_cfg, dict):
+                    cfg_data = loaded_cfg
+                    if not res["pipeline_tag"] and cfg_data.get("pipeline_tag"):
+                        res["pipeline_tag"] = str(cfg_data["pipeline_tag"])
+            except Exception:
+                pass
+
+        lib = (res["library_name"] or str(card_data.get("library_name") or "")).lower()
+        p_tag = (res["pipeline_tag"] or str(card_data.get("pipeline_tag") or "")).lower()
+
+        # 3. Detect Framework & Weight Artifacts
+        sklearn_files = [f for f in files if f in ("model.joblib", "model.pkl", "model.pickle") or f.endswith((".joblib", ".pkl", ".pickle"))]
+        keras_files = [f for f in files if f in ("saved_model.pb", "keras_metadata.pb", "model.keras") or f.endswith((".keras", ".h5"))]
+        onnx_files = [f for f in files if f.endswith(".onnx")]
+        jax_files = [f for f in files if f.endswith((".msgpack", ".flax"))]
+        pytorch_files = [f for f in files if f.endswith((".safetensors", ".bin", ".pt", ".pth"))]
+        xgboost_files = [f for f in files if f.endswith((".ubj",)) or ("xgboost" in f.lower() and f.endswith((".json", ".model")))]
+        lightgbm_files = [f for f in files if "lightgbm" in f.lower() and f.endswith((".txt", ".model"))]
+        catboost_files = [f for f in files if f.endswith((".cbm",))]
+        openvino_files = [f for f in files if f.endswith((".xml",))]
+        tensorrt_files = [f for f in files if f.endswith((".engine", ".plan"))]
+        coreml_files = [f for f in files if f.endswith((".mlmodel", ".mlpackage"))]
+        tflite_files = [f for f in files if f.endswith((".tflite",))]
+        paddle_files = [f for f in files if f.endswith((".pdmodel", ".pdparams"))]
+        mxnet_files = [f for f in files if f.endswith((".params",))]
+
+        has_any_weights = bool(
+            sklearn_files or keras_files or onnx_files or jax_files or pytorch_files
+            or xgboost_files or lightgbm_files or catboost_files or openvino_files
+            or tensorrt_files or coreml_files or tflite_files or paddle_files or mxnet_files
+        )
+
+        if pytorch_files:
+            res["framework"] = "pytorch"
+            res["is_model_repo"] = True
+            res["model_file"] = pytorch_files[0]
+        elif xgboost_files or "xgboost" in lib or "xgboost" in tags:
+            res["framework"] = "xgboost"
+            res["is_model_repo"] = bool(xgboost_files)
+            if xgboost_files:
+                res["model_file"] = xgboost_files[0]
+        elif lightgbm_files or "lightgbm" in lib or "lightgbm" in tags:
+            res["framework"] = "lightgbm"
+            res["is_model_repo"] = bool(lightgbm_files)
+            if lightgbm_files:
+                res["model_file"] = lightgbm_files[0]
+        elif catboost_files or "catboost" in lib or "catboost" in tags:
+            res["framework"] = "catboost"
+            res["is_model_repo"] = bool(catboost_files)
+            if catboost_files:
+                res["model_file"] = catboost_files[0]
+        elif openvino_files or "openvino" in lib:
+            res["framework"] = "openvino"
+            res["is_model_repo"] = bool(openvino_files)
+            if openvino_files:
+                res["model_file"] = openvino_files[0]
+        elif tensorrt_files or "tensorrt" in lib:
+            res["framework"] = "tensorrt"
+            res["is_model_repo"] = bool(tensorrt_files)
+            if tensorrt_files:
+                res["model_file"] = tensorrt_files[0]
+        elif coreml_files or "coreml" in lib:
+            res["framework"] = "coreml"
+            res["is_model_repo"] = bool(coreml_files)
+            if coreml_files:
+                res["model_file"] = coreml_files[0]
+        elif tflite_files or "tflite" in lib:
+            res["framework"] = "tflite"
+            res["is_model_repo"] = bool(tflite_files)
+            if tflite_files:
+                res["model_file"] = tflite_files[0]
+        elif paddle_files or "paddle" in lib or "paddlepaddle" in tags:
+            res["framework"] = "paddle"
+            res["is_model_repo"] = bool(paddle_files)
+            if paddle_files:
+                res["model_file"] = paddle_files[0]
+        elif mxnet_files or "mxnet" in lib:
+            res["framework"] = "mxnet"
+            res["is_model_repo"] = bool(mxnet_files)
+            if mxnet_files:
+                res["model_file"] = mxnet_files[0]
+        elif sklearn_files or "sklearn" in lib or "sklearn" in tags or "skops" in tags or "sklearn" in cfg_data:
+            res["framework"] = "sklearn"
+            res["is_model_repo"] = bool(sklearn_files)
+            for cand in ("clf.pkl", "sklearn_model.joblib", "model.joblib", "model.pkl", "model.pickle"):
+                if cand in sklearn_files:
+                    res["model_file"] = cand
+                    break
+            if res["model_file"] is None and sklearn_files:
+                res["model_file"] = sklearn_files[0]
+        elif keras_files or any(k in lib for k in ("tf-keras", "keras", "tensorflow")):
+            res["framework"] = "keras"
+            res["is_model_repo"] = bool(keras_files)
+            if keras_files:
+                res["model_file"] = keras_files[0]
+        elif onnx_files or "onnx" in lib:
+            res["framework"] = "onnx"
+            res["is_model_repo"] = bool(onnx_files)
+            if onnx_files:
+                res["model_file"] = onnx_files[0]
+        elif jax_files or any(k in lib for k in ("flax", "jax")):
+            res["framework"] = "jax"
+            res["is_model_repo"] = bool(jax_files)
+            if jax_files:
+                res["model_file"] = jax_files[0]
+        elif "pytorch" in tags or "transformers" in lib or "architectures" in cfg_data:
+            res["framework"] = "pytorch"
+            res["is_model_repo"] = has_any_weights
+
+        # Classify repository type accurately
+        if res["is_model_repo"]:
+            res["repo_type"] = "model"
+        elif files:
+            lower_files = [f.lower() for f in files]
+            has_dataset_files = any(
+                f in ("dataset_info.json", "dataset_dict.json") or f.endswith((".parquet", ".arrow"))
+                for f in lower_files
+            ) or (
+                any(f.endswith((".csv", ".tsv", ".jsonl")) for f in lower_files)
+                and not cfg_data
+            )
+            has_code_only = all(
+                f.startswith(".") or f.endswith((".py", ".ipynb", ".md", ".txt", ".yml", ".yaml", ".json", ".toml", ".sh"))
+                for f in lower_files
+            )
+            if has_dataset_files:
+                res["repo_type"] = "dataset"
+            elif has_code_only:
+                res["repo_type"] = "source_only" if any(f.endswith((".py", ".ipynb")) for f in lower_files) else "incomplete"
+            else:
+                res["repo_type"] = "incomplete"
+
+        # 4. Detect Domain
+        if any(k in p_tag for k in ("tabular", "tabular-classification", "tabular-regression")) or "tabular-classification" in tags or "tabular" in tags:
+            res["domain"] = "tabular"
+        elif any(k in p_tag for k in ("time-series", "forecasting", "timeseries")) or any("time-series" in t or "timeseries" in t for t in tags):
+            res["domain"] = "time-series"
+        elif any(k in p_tag for k in ("text", "nlp", "sentence-similarity", "translation", "summarization", "fill-mask")) or "text-classification" in tags:
+            res["domain"] = "text"
+        elif any(k in p_tag for k in ("image", "vision", "object-detection", "segmentation")) or "image-classification" in tags:
+            res["domain"] = "image"
+        elif res["framework"] == "sklearn":
+            res["domain"] = "tabular"
+
+        # 5. Detect Task Type
+        if any(k in p_tag for k in ("forecasting", "time-series-forecasting", "regression")):
+            res["task_type"] = "forecasting" if "forecasting" in p_tag else "regression"
+        else:
+            res["task_type"] = "classification"
+
+    except Exception as exc:
+        res["error"] = str(exc)
+
+    _HF_REPO_INFO_CACHE[clean_id] = res
+    return res
+
+
 def detect_model_framework(
     model_or_path: Any,
     framework_override: Optional[str] = None,
     model_class: Optional[Any] = None,
 ) -> str:
     """
-    Determine model framework ('sklearn', 'pytorch', 'tensorflow').
+    Determine model framework ('sklearn', 'pytorch', 'tensorflow', 'keras', 'onnx', 'jax').
     Never conflates source ('huggingface') with execution framework.
     """
     if framework_override:
         clean = framework_override.lower().strip()
-        if clean in ("pytorch", "pytorch_local", "sklearn", "tensorflow"):
+        if clean in (
+            "pytorch", "pytorch_local", "sklearn", "tensorflow", "keras", "onnx", "jax",
+            "xgboost", "lightgbm", "catboost", "openvino", "tensorrt", "coreml", "tflite", "paddle", "mxnet",
+        ):
             return clean
 
     # 1. In-memory inspection
@@ -163,22 +444,61 @@ def detect_model_framework(
     if model_class is not None and isinstance(model_class, type) and issubclass(model_class, torch.nn.Module):
         return "pytorch"
 
+    # Duck-typing for tree models
+    t_name = model_or_path.__class__.__name__.lower() if not isinstance(model_or_path, (str, Path)) else ""
+    if "xgb" in t_name or "xgboost" in t_name:
+        return "xgboost"
+    if "lgbm" in t_name or "lightgbm" in t_name:
+        return "lightgbm"
+    if "catboost" in t_name:
+        return "catboost"
+
     if is_sklearn_model(model_or_path):
         return "sklearn"
 
-    # 2. File extension inspection
+    # 2. File extension and repository inspection
     if isinstance(model_or_path, (str, Path)):
         p_str = str(model_or_path).lower()
         if p_str.endswith((".pt", ".pth", ".safetensors", ".ckpt", ".bin")):
             return "pytorch"
-        if p_str.endswith((".joblib",)):
+        if p_str.endswith((".joblib", ".pkl", ".pickle")):
             return "sklearn"
-        if p_str.endswith((".pkl", ".pickle")):
-            return "sklearn"
-        # Check Hugging Face repos for scikit-learn estimators
+        if p_str.endswith((".onnx",)):
+            return "onnx"
+        if p_str.endswith((".tflite",)):
+            return "tflite"
+        if p_str.endswith((".cbm",)):
+            return "catboost"
+        if p_str.endswith((".engine", ".plan")):
+            return "tensorrt"
+        if p_str.endswith((".mlmodel", ".mlpackage")):
+            return "coreml"
+        if p_str.endswith((".h5", ".hdf5", ".keras")):
+            return "keras"
+        if p_str.endswith((".pb",)):
+            return "tensorflow"
+        if p_str.endswith((".msgpack", ".flax")):
+            return "jax"
+        if p_str.endswith((".pdmodel", ".pdparams")):
+            return "paddle"
+        if p_str.endswith((".params",)):
+            return "mxnet"
+        if p_str.endswith((".xml",)):
+            return "openvino"
+        if p_str.endswith((".ubj",)):
+            return "xgboost"
+
+        # Check Hugging Face repos dynamically
         if "/" in p_str and not p_str.startswith((".", "/")):
+            hf_info = detect_hf_repo_info(str(model_or_path))
+            if hf_info.get("framework") and hf_info["framework"] != "unknown":
+                return hf_info["framework"]
+
             if p_str.startswith("scikit-learn/") or "sklearn" in p_str:
                 return "sklearn"
+            if p_str.startswith("keras-io/") or "keras" in p_str:
+                return "keras"
+
             try:
                 from huggingface_hub import hf_hub_download
                 cfg_p = hf_hub_download(str(model_or_path), "config.json", local_files_only=True)
@@ -269,7 +589,7 @@ def detect_model_domain(
     # 2. Check processor / tokenizer name
     if processor_name and isinstance(processor_name, str):
         proc_lower = processor_name.lower().replace("_", "-")
-        if any(k in proc_lower for k in ("tabular", "tab-processor", "tabular-processor")):
+        if any(k in proc_lower for k in ("tabular", "tab-processor", "tabular-processor", "tabpfn")):
             return "tabular"
         if any(k in proc_lower for k in ("timeseries", "time-series", "ts-processor")):
             return "time-series"
@@ -319,7 +639,7 @@ def detect_model_domain(
 
     if target_model is not None:
         cls_name = target_model.__class__.__name__.lower()
-        if any(k in cls_name for k in ("tabular", "tabnet", "fttransformer", "tabtransformer", "tabularmlp", "tabularclassifier")):
+        if any(k in cls_name for k in ("tabular", "tabnet", "fttransformer", "tabtransformer", "tabularmlp", "tabularclassifier", "tabpfn")):
             return "tabular"
         ts_model_keywords = (
             "patchtst", "patchtsmixer", "timesnet", "informer", "autoformer",
@@ -358,6 +678,12 @@ def detect_model_domain(
     if isinstance(model_or_path, str):
         name_lower = model_or_path.lower().replace("_", "-")
 
+        # Check Hugging Face repos dynamically first
+        if "/" in model_or_path and not model_or_path.startswith((".", "/")):
+            hf_info = detect_hf_repo_info(model_or_path)
+            if hf_info.get("domain") and hf_info["domain"] != "unknown":
+                return hf_info["domain"]
+
         text_keywords = (
             "bert", "roberta", "gpt", "llama", "t5", "bart", "electra", "distilbert",
             "albert", "deberta", "sentiment", "imdb", "nlp", "sequenceclassification",
@@ -376,7 +702,7 @@ def detect_model_domain(
             "lstm", "gru", "ecg", "sensor", "telemetry", "temporal"
         )
         tabular_keywords = (
-            "tabular", "tabnet", "tabtransformer", "fttransformer", "tabularmlp",
+            "tabular", "tabnet", "tabtransformer", "fttransformer", "tabularmlp", "tabpfn",
             "credit", "fraud", "census", "adult", "churn", "housing", "titanic"
         )
 

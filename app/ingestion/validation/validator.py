@@ -21,7 +21,10 @@ class ModelValidator:
     and runtime configuration before loading.
     """
 
-    SUPPORTED_FRAMEWORKS = {"huggingface", "pytorch", "pytorch_local", "sklearn"}
+    SUPPORTED_FRAMEWORKS = {
+        "huggingface", "pytorch", "pytorch_local", "sklearn", "keras", "tensorflow", "onnx",
+        "xgboost", "lightgbm", "catboost", "openvino", "tensorrt", "coreml", "tflite", "paddle", "mxnet",
+    }
     SUPPORTED_DOMAINS = {"image", "text", "time-series", "tabular"}
 
     @classmethod
@@ -163,6 +166,10 @@ class ModelValidator:
                 outputs = adapter.predict(sample_input)
                 if outputs is None:
                     raise ModelValidationError("Model output is None during sample inference.")
+
+                # Check for empty output
+                if hasattr(outputs, "shape") and (len(outputs.shape) == 0 or any(dim == 0 for dim in outputs.shape)):
+                    raise ModelValidationError(f"Model output has empty shape: {getattr(outputs, 'shape', None)}")
 
                 # Check for NaN or Inf values if outputs are tensors or numpy arrays
                 if isinstance(outputs, torch.Tensor):

@@ -94,7 +94,7 @@ def test_validator_configuration_invalid_framework():
         ModelValidator.validate_configuration({"model_id": "m1", "data_domain": "image", "task_type": "classification"})
 
     with pytest.raises(UnsupportedModelError, match="Unsupported framework"):
-        ModelValidator.validate_configuration({"model_id": "m1", "framework": "tensorflow", "data_domain": "image", "task_type": "classification"})
+        ModelValidator.validate_configuration({"model_id": "m1", "framework": "unsupported_fw", "data_domain": "image", "task_type": "classification"})
 
 
 def test_validator_configuration_unsupported_domain():

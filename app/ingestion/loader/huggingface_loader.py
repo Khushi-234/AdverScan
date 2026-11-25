@@ -38,7 +38,7 @@ class HuggingFaceLoader(BaseModelLoader):
     from Hugging Face Model Hub or local model directories.
     """
 
-    SUPPORTED_DOMAINS = {"image", "text", "time-series" , "tabular"}
+    SUPPORTED_DOMAINS = {"image", "text", "time-series", "tabular"}
 
     def load(
         self,
@@ -87,7 +87,70 @@ class HuggingFaceLoader(BaseModelLoader):
         if domain_str not in self.SUPPORTED_DOMAINS:
             raise ModelLoadError(
                 f"Could not automatically determine model domain for Hugging Face model '{model_id}' (domain: '{domain_str}'). "
-                f"Please explicitly specify domain='image', domain='text', or domain='time-series'."
+                f"Please explicitly specify domain='image', domain='text', domain='time-series', or domain='tabular'."
+            )
+
+        # Inspect repository structure and route to appropriate framework loader
+        from app.ingestion.utils.model_utils import detect_hf_repo_info
+        hf_info = detect_hf_repo_info(model_id)
+
+        repo_type = hf_info.get("repo_type")
+        if repo_type == "dataset":
+            raise ModelLoadError(
+                f"Hugging Face repository '{model_id}' appears to be a dataset repository, not a model repository. "
+                f"Available files: {hf_info.get('files', [])}"
+            )
+        if repo_type == "source_only":
+            raise ModelLoadError(
+                f"Hugging Face repository '{model_id}' contains only source code/documentation and no serialized model weights. "
+                f"Available files: {hf_info.get('files', [])}"
+            )
+
+        if hf_info.get("framework") == "sklearn":
+            from app.ingestion.loader.sklearn_loader import SklearnLoader
+            allow_pickle = kwargs.pop("unsafe_allow_pickle", False)
+            return SklearnLoader().load(model_id, unsafe_allow_pickle=allow_pickle, **kwargs)
+
+        if hf_info.get("framework") in ("keras", "tensorflow"):
+            try:
+                import tensorflow as tf
+                from huggingface_hub import snapshot_download
+                local_dir = snapshot_download(model_id)
+                return tf.keras.models.load_model(local_dir)
+            except ImportError:
+                raise ModelLoadError(
+                    f"Hugging Face repository '{model_id}' contains a TensorFlow/Keras SavedModel, "
+                    f"which requires the 'tensorflow' package. TensorFlow is not installed in the current environment. "
+                    f"Please install 'tensorflow' to ingest and evaluate TensorFlow/Keras models."
+                )
+
+        if hf_info.get("framework") == "onnx":
+            try:
+                import onnxruntime
+                from huggingface_hub import hf_hub_download
+                onnx_file = hf_info.get("model_file") or next(
+                    (f for f in hf_info.get("files", []) if f.endswith(".onnx")), None
+                )
+                if not onnx_file:
+                    raise ModelLoadError(f"No .onnx model file found in Hugging Face repository '{model_id}'.")
+                local_onnx = hf_hub_download(model_id, onnx_file)
+                return onnxruntime.InferenceSession(local_onnx)
+            except ImportError:
+                raise ModelLoadError(
+                    f"Hugging Face repository '{model_id}' contains an ONNX model, which requires 'onnxruntime'. "
+                    f"onnxruntime is not installed in the current environment."
+                )
+
+        if hf_info.get("framework") == "jax":
+            raise UnsupportedTaskError(
+                f"Hugging Face repository '{model_id}' contains a JAX/Flax model. "
+                f"AdverScan currently supports PyTorch, Scikit-learn, and ONNX models."
+            )
+
+        if hf_info.get("files") and not hf_info.get("is_model_repo"):
+            raise ModelLoadError(
+                f"Hugging Face repository '{model_id}' does not contain recognized serialized model weights. "
+                f"Available files: {hf_info.get('files', [])}"
             )
 
         try:
@@ -173,7 +236,7 @@ class HuggingFaceLoader(BaseModelLoader):
                         last_exc = e2
                         # Fallback for gliner2 AutoExtractor
                         try:
-                            from gliner2 import AutoExtractor
+                            from gliner2 import AutoExtractor  # type: ignore[import-not-found,import]
                             extractor = AutoExtractor.from_pretrained(model_id, **kwargs)
                             model = getattr(extractor, "encoder", getattr(extractor, "model", extractor))
                         except Exception as e3:
