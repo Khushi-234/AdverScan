@@ -101,9 +101,13 @@ def test_bazyl_gtsrb_model_ingestion_and_image_inference():
         model_identifier="bazyl/gtsrb-model",
         dataset_name="bazyl/GTSRB",
         data_domain="image",
-        framework="huggingface",
+        framework="auto",
         sample_size=5,
+        unsafe_allow_pickle=False,
+        force_refresh=True,
+        allow_synthetic_fallback=False,
     )
+    assert res["dataset_source"] == "real_dataset"
     adapter = res["adapter"]
     metadata = res["metadata"]
     assert metadata.framework == "huggingface"

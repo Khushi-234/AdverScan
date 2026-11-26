@@ -231,13 +231,23 @@ def get_dataset_loader(
     if clean_ds_key in known_text_datasets and domain_clean in ("image", "vision"):
         domain_clean = "text"
 
+    _tabular_only_keys = {
+        "data",
+        "model_id",
+        "feature_names",
+        "raw_input_features",
+        "preprocessing_info",
+        "expected_num_features",
+    }
+
     if domain_clean in ("image", "vision"):
+        vision_kwargs = {k: v for k, v in kwargs.items() if k not in _tabular_only_keys}
         return HFVisionDatasetLoader(
             dataset_name=dataset_name,
             processor_name=processor_name,
             split=split,
             batch_size=batch_size,
-            **kwargs,
+            **vision_kwargs,
         )
     elif domain_clean in ("text", "nlp"):
         candidate_id = kwargs.get("data") or dataset_name
@@ -245,12 +255,13 @@ def get_dataset_loader(
             candidate_id, [".txt", ".csv", ".tsv", ".json", ".jsonl"]
         )
         target_name = resolved_file or dataset_name
+        text_kwargs = {k: v for k, v in kwargs.items() if k not in _tabular_only_keys}
         return HFTextDatasetLoader(
             dataset_name=target_name,
             tokenizer_name=processor_name,
             split=split,
             batch_size=batch_size,
-            **kwargs,
+            **text_kwargs,
         )
     elif domain_clean in ("time_series", "timeseries", "sequence"):
         inputs = kwargs.get("inputs")
