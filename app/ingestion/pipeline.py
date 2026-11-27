@@ -528,19 +528,24 @@ def ingest_model(
             elif domain_clean == "text" and processor is not None:
                 validation_sample = ["AdverScan validation sample text."]
             elif domain_clean == "time-series":
-                s_len = config_dict.get("sequence_length")
-                n_ch = config_dict.get("num_channels") or 1
-                if hasattr(raw_model, "config"):
-                    cfg = getattr(raw_model, "config")
-                    s_len = s_len or getattr(cfg, "context_length", getattr(cfg, "sequence_length", None))
-                    n_ch = n_ch or getattr(cfg, "num_input_channels", getattr(cfg, "in_channels", n_ch))
-                if s_len is not None:
-                    # Try batch_length_channels [B, L, C] then batch_channels_length [B, C, L]
-                    validation_sample = torch.randn(2, int(s_len), int(n_ch))
-                    try:
-                        adapter.predict(validation_sample)
-                    except Exception:
-                        validation_sample = torch.randn(2, int(n_ch), int(s_len))
+                saved_shape = getattr(raw_model, "_savedmodel_input_shape", None) or getattr(raw_model, "input_shape", None)
+                if isinstance(saved_shape, (tuple, list)) and len(saved_shape) >= 2 and all(isinstance(d, int) and d > 0 for d in saved_shape[1:]):
+                    validation_sample = torch.randn(2, *[int(d) for d in saved_shape[1:]])
+                else:
+                    s_len = config_dict.get("sequence_length")
+                    n_ch = config_dict.get("num_channels")
+                    if hasattr(raw_model, "config"):
+                        cfg = getattr(raw_model, "config")
+                        s_len = s_len or getattr(cfg, "context_length", getattr(cfg, "sequence_length", None))
+                        n_ch = n_ch or getattr(cfg, "num_input_channels", getattr(cfg, "in_channels", None))
+                    n_ch = n_ch or 1
+                    if s_len is not None:
+                        # Try batch_length_channels [B, L, C] then batch_channels_length [B, C, L]
+                        validation_sample = torch.randn(2, int(s_len), int(n_ch))
+                        try:
+                            adapter.predict(validation_sample)
+                        except Exception:
+                            validation_sample = torch.randn(2, int(n_ch), int(s_len))
             elif domain_clean == "image":
                 res = config_dict.get("input_resolution") or (3, 224, 224)
                 if len(res) == 2:

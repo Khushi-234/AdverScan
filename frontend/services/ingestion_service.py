@@ -9,6 +9,7 @@ Extracts comprehensive telemetry matching scripts/run_pipeline_for_multimodel.py
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 import pandas as pd
@@ -601,7 +602,7 @@ def load_model_and_dataset(
             if test_inputs is not None and test_labels is not None:
                 # Verify dataset compatibility with the model's prediction interface
                 try:
-                    sample_probe = test_inputs[:1] if hasattr(test_inputs, "__getitem__") else test_inputs
+                    sample_probe = _slice_sample_probe(test_inputs, 1)
                     _ = adapter.predict(sample_probe)
                 except Exception as compat_exc:
                     raise DatasetFormatError(
@@ -806,13 +807,31 @@ def load_model_and_dataset(
     }
 
 
+def _slice_sample_probe(inputs: Any, count: int = 1) -> Any:
+    """Safely extract a small probe batch across tensors, lists, dicts, and HF BatchEncoding mappings."""
+    if isinstance(inputs, Mapping):
+        return {
+            k: (
+                v[:count]
+                if hasattr(v, "__getitem__") and not isinstance(v, (str, bytes))
+                else v
+            )
+            for k, v in inputs.items()
+        }
+    if isinstance(inputs, (str, bytes)):
+        return inputs
+    if hasattr(inputs, "__getitem__"):
+        return inputs[:count]
+    return inputs
+
+
 def _get_input_sample_count(inputs: Any, default: int = 1) -> int:
     """Safely count number of evaluation samples across tensors, dicts, BatchEncodings, and lists."""
     if inputs is None:
         return default
     if hasattr(inputs, "shape") and len(inputs.shape) > 0:
         return int(inputs.shape[0])
-    if isinstance(inputs, dict):
+    if isinstance(inputs, Mapping):
         for k in ("input_ids", "inputs", "pixel_values", "values"):
             if k in inputs and hasattr(inputs[k], "shape") and len(inputs[k].shape) > 0:
                 return int(inputs[k].shape[0])
@@ -833,7 +852,7 @@ def _get_input_shape_desc(inputs: Any) -> Tuple[Optional[List[int]], str]:
             return list(inputs.shape[1:]), str(list(inputs.shape))
         except Exception:
             pass
-    if isinstance(inputs, dict):
+    if isinstance(inputs, Mapping):
         for k in ("input_ids", "inputs", "pixel_values", "values"):
             if k in inputs and hasattr(inputs[k], "shape"):
                 return list(inputs[k].shape[1:]), f"Dict[{k}: {list(inputs[k].shape)}]"

@@ -8,6 +8,7 @@ budget control (--budget), and skipping (--skip-xai).
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -34,14 +35,41 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        default="cardiffnlp/twitter-roberta-base-sentiment-latest",
-        help="Target model identifier or path (default: cardiffnlp/twitter-roberta-base-sentiment-latest)",
+        default=None,
+        help="Target model identifier or path (default: interactive prompt, or bhadresh-savani/distilbert-base-uncased-emotion with --demo)",
     )
     parser.add_argument(
         "--dataset",
         type=str,
         default=None,
         help="Optional dataset name or split",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=100,
+        help="Number of evaluation samples to run (default: 100)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help="Execution device: cpu or cuda (default: cpu)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Evaluate all model presets sequentially",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Disable interactive terminal prompts and use CLI arguments or defaults",
+    )
+    parser.add_argument(
+        "--verify-ingestion",
+        action="store_true",
+        help="Also verify frontend.services.ingestion_service.load_model_and_dataset compatibility",
     )
     parser.add_argument(
         "--xai-mode",
@@ -81,7 +109,7 @@ def parse_args():
     parser.add_argument(
         "--demo",
         action="store_true",
-        help="Disable interactive terminal prompts and use default arguments",
+        help="Disable interactive terminal prompts and run default DistilBERT emotion demo",
     )
     return parser.parse_args()
 
@@ -195,15 +223,18 @@ def run_single_evaluation(
     if domain == "image":
         sample_input = torch.randn(1, 3, 224, 224)
     elif domain == "time-series":
-        seq_len = env_info.get("sequence_length") or 14
+        seq_len = env_info.get("sequence_length")
         num_ch = env_info.get("num_channels") or 1
-        if "patchtst" in resolved_model_id.lower() or "patchtsmixer" in resolved_model_id.lower() or "transformer" in str(env_info.get("model_type", "")).lower():
-            sample_input = torch.randn(1, seq_len, num_ch)
+        if seq_len is not None:
+            if "patchtst" in resolved_model_id.lower() or "patchtsmixer" in resolved_model_id.lower() or "transformer" in str(env_info.get("model_type", "")).lower():
+                sample_input = torch.randn(1, seq_len, num_ch)
+            else:
+                sample_input = torch.randn(1, num_ch, seq_len)
         else:
-            sample_input = torch.randn(1, num_ch, seq_len)
+            sample_input = None
     elif domain == "tabular":
-        num_feats = env_info.get("num_features") or 14
-        sample_input = torch.randn(1, num_feats)
+        num_feats = env_info.get("num_features")
+        sample_input = torch.randn(1, num_feats) if num_feats else None
     else:
         sample_input = "AdverScan clean baseline evaluation sample sentence."
 
@@ -273,17 +304,28 @@ def run_single_evaluation(
     from app.evaluation.dataset_loader.factory import resolve_dataset_file
 
     if domain == "tabular":
-        data_file = resolve_dataset_file(dataset_name, [".csv", ".tsv"], model_identifier=model_id)
+        from app.evaluation.dataset_loader.factory import resolve_tabular_dataset_source
 
-        if data_file:
-            print(f"  ✓ Dynamically resolved tabular dataset: '{data_file}'")
-            eval_kwargs["data"] = data_file
+        data_source = resolve_tabular_dataset_source(
+            dataset_name=dataset_name,
+            model_id=resolved_model_id,
+            split=split_str,
+            feature_names=getattr(adapter, "feature_names", None),
+            raw_input_features=getattr(adapter, "raw_input_features", None),
+        )
+
+        if data_source is not None:
+            desc = data_source if isinstance(data_source, str) else f"DataFrame ({len(data_source)} rows)"
+            print(f"  ✓ Dynamically resolved tabular dataset: '{desc}'")
+            eval_kwargs["data"] = data_source
             eval_kwargs["target_col"] = "target"
         else:
-            print("  [INFO] No local CSV dataset path found; evaluating on synthetic sample inputs.")
+            print("  [INFO] No real tabular dataset found; evaluating on synthetic sample inputs.")
             num_eval_samples = samples if samples > 0 else 100
             if isinstance(sample_input, torch.Tensor):
                 input_shape_eval = (num_eval_samples,) + tuple(sample_input.shape[1:])
+            elif getattr(metadata, "input_shape", None) and len(metadata.input_shape) >= 1:
+                input_shape_eval = (num_eval_samples, int(metadata.input_shape[-1]))
             else:
                 input_shape_eval = (num_eval_samples, 14)
             eval_inputs = torch.randn(input_shape_eval)
@@ -332,6 +374,8 @@ def run_single_evaluation(
             num_eval_samples = samples if samples > 0 else 100
             if isinstance(sample_input, torch.Tensor):
                 input_shape_eval = (num_eval_samples,) + tuple(sample_input.shape[1:])
+            elif getattr(metadata, "input_shape", None) and len(metadata.input_shape) >= 2:
+                input_shape_eval = (num_eval_samples,) + tuple(int(d) for d in metadata.input_shape[1:])
             else:
                 input_shape_eval = (num_eval_samples, 1, 14)
             eval_inputs = torch.randn(input_shape_eval)
@@ -402,7 +446,7 @@ def main():
 
     if args.all:
         evaluate_all = True
-    elif not args.non_interactive and args.model is None:
+    elif not (args.non_interactive or args.demo) and args.model is None:
         p_model, p_dataset, p_proc, p_dom = prompt_model_selection()
         evaluate_all = (p_model == "__all__")
         if not evaluate_all:
@@ -411,11 +455,36 @@ def main():
             processor_name = p_proc
             data_domain = p_dom
     else:
-        model_id = args.model or "bazyl/gtsrb-model"
+        model_id = args.model or "bhadresh-savani/distilbert-base-uncased-emotion"
         resolved_info = ModelPresetRegistry.resolve_model_info(model_id)
-        dataset_name = args.dataset or resolved_info.get("dataset_name", "bazyl/GTSRB")
+        default_ds = (
+            "dair-ai/emotion"
+            if model_id == "bhadresh-savani/distilbert-base-uncased-emotion"
+            else resolved_info.get("dataset_name", "bazyl/GTSRB")
+        )
+        dataset_name = args.dataset or default_ds
         processor_name = resolved_info.get("processor_name", model_id)
-        data_domain = resolved_info.get("data_domain")
+        data_domain = resolved_info.get("data_domain") or (
+            "text" if model_id == "bhadresh-savani/distilbert-base-uncased-emotion" else None
+        )
+
+    if args.verify_ingestion and not evaluate_all:
+        from frontend.services.ingestion_service import load_model_and_dataset
+
+        print(f"\n[0/3] Verifying frontend ingestion service for '{model_id}' + '{dataset_name}'...")
+        ingest_out = load_model_and_dataset(
+            model_identifier=model_id,
+            dataset_name=dataset_name,
+            data_domain=data_domain,
+            device=args.device,
+            sample_size=min(args.samples, 10) if args.samples > 0 else 10,
+            allow_synthetic_fallback=False,
+        )
+        print(
+            f"  ✓ Frontend ingestion succeeded: domain={ingest_out['domain']}, "
+            f"dataset={ingest_out['dataset_name']}, "
+            f"shape={ingest_out['telemetry'].get('input_shape_str')}"
+        )
 
     device = args.device
 

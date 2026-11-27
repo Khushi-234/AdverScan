@@ -319,3 +319,29 @@ def test_pipeline_universal_format_detection_and_informative_errors():
     with pytest.raises(ModelLoadError, match="requires 'coremltools'"):
         with patch.dict("sys.modules", {"coremltools": None}):
             ingest_model("models/network.mlmodel")
+
+
+def test_slice_sample_probe_preserves_batch_encoding_mapping():
+    """Verify BatchEncoding is sliced per-field rather than returning internal Encoding objects."""
+    from transformers import BatchEncoding
+    from frontend.services.ingestion_service import (
+        _get_input_sample_count,
+        _get_input_shape_desc,
+        _slice_sample_probe,
+    )
+
+    enc = BatchEncoding(
+        {
+            "input_ids": torch.tensor([[101, 200, 102], [101, 300, 102], [101, 400, 102]]),
+            "attention_mask": torch.tensor([[1, 1, 1], [1, 1, 1], [1, 1, 1]]),
+        }
+    )
+
+    probe = _slice_sample_probe(enc, 1)
+    assert isinstance(probe, dict)
+    assert probe["input_ids"].shape == (1, 3)
+    assert probe["attention_mask"].shape == (1, 3)
+    assert _get_input_sample_count(enc) == 3
+    shape, desc = _get_input_shape_desc(enc)
+    assert shape == [3]
+    assert "input_ids" in desc

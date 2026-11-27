@@ -176,7 +176,11 @@ def resolve_tabular_dataset_source(
             from huggingface_hub import hf_hub_download
 
             hf_info = detect_hf_repo_info(str(model_id))
-            for ds_file in hf_info.get("dataset_files", []) or []:
+            ds_files = list(hf_info.get("dataset_files", []) or [])
+            if dataset_name and not is_placeholder:
+                ds_key = str(dataset_name).strip().lower()
+                ds_files.sort(key=lambda f: (0 if str(f).lower() == ds_key or str(f).lower().endswith("/" + ds_key) else 1))
+            for ds_file in ds_files:
                 try:
                     local_ds = hf_hub_download(str(model_id), ds_file)
                     if local_ds and _schema_matches_model(local_ds, feature_names, raw_input_features):
@@ -202,6 +206,71 @@ def resolve_tabular_dataset_source(
             return local_model_ds
 
     return None
+
+
+def _load_hf_timeseries_source(
+    dataset_name: Optional[str],
+    model_id: Optional[str] = None,
+    split: str = "test",
+) -> Tuple[Optional[Any], Optional[Any]]:
+    """
+    Resolve a time-series dataset from bundled HF model repo files or a Hugging Face
+    dataset identifier (`owner/dataset`) via `datasets.load_dataset`.
+    Returns `(inputs, targets)` or `(None, None)` if unavailable.
+    """
+    ts_exts = (".pt", ".pth", ".npz", ".npy", ".csv", ".tsv", ".parquet")
+    is_placeholder = not dataset_name or str(dataset_name).strip().lower() in (
+        "", "custom_dataset", "evaluation-dataset", "none"
+    )
+
+    # 1. Check HF model repo for bundled time-series files
+    if model_id and "/" in str(model_id) and not str(model_id).startswith((".", "/")):
+        try:
+            from app.ingestion.utils.model_utils import detect_hf_repo_info
+            from huggingface_hub import hf_hub_download
+
+            hf_info = detect_hf_repo_info(str(model_id))
+            ds_files = list(hf_info.get("dataset_files", []) or [])
+            if dataset_name and not is_placeholder:
+                ds_key = str(dataset_name).strip().lower()
+                ds_files.sort(key=lambda f: (0 if str(f).lower() == ds_key or str(f).lower().endswith("/" + ds_key) else 1))
+            for ds_file in ds_files:
+                if str(ds_file).lower().endswith(ts_exts):
+                    try:
+                        local_ds = hf_hub_download(str(model_id), ds_file)
+                        if local_ds:
+                            return local_ds, None
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    # 2. Load Hugging Face Hub dataset (owner/dataset)
+    if not is_placeholder and dataset_name and "/" in str(dataset_name) and not str(dataset_name).startswith((".", "/")):
+        df = _load_hf_dataset_as_dataframe(str(dataset_name), split=split)
+        if df is not None and not df.empty:
+            import numpy as np
+
+            target_candidates = ["target", "label", "labels", "class", "y"]
+            target_col = next((c for c in target_candidates if c in df.columns), None)
+            targets = df[target_col].to_numpy() if target_col else None
+            feat_df = df.drop(columns=[target_col]) if target_col else df
+
+            # Handle sequence-valued columns (e.g. list/array per row) or numeric tabular columns
+            seq_cols = [
+                c for c in feat_df.columns
+                if len(feat_df) > 0 and isinstance(feat_df[c].iloc[0], (list, tuple, np.ndarray))
+            ]
+            if seq_cols:
+                arrays = [np.stack([np.asarray(v, dtype=np.float32) for v in feat_df[c]]) for c in seq_cols]
+                inputs = arrays[0] if len(arrays) == 1 else np.stack(arrays, axis=-1)
+                return inputs, targets
+
+            num_df = feat_df.select_dtypes(include=["number"])
+            if not num_df.empty:
+                return num_df.to_numpy(dtype=np.float32), targets
+
+    return None, None
 
 
 def get_dataset_loader(
@@ -280,8 +349,19 @@ def get_dataset_loader(
                 inputs = resolved_file
 
         if inputs is None:
+            hf_inputs, hf_targets = _load_hf_timeseries_source(
+                dataset_name=dataset_name,
+                model_id=kwargs.get("model_name") or kwargs.get("model_id"),
+                split=split,
+            )
+            if hf_inputs is not None:
+                inputs = hf_inputs
+                if targets is None:
+                    targets = hf_targets
+
+        if inputs is None:
             raise ValueError(
-                f"TimeSeriesDatasetLoader requires 'inputs' and 'targets' keyword arguments or a resolvable time-series file for '{dataset_name}'."
+                f"TimeSeriesDatasetLoader requires 'inputs' and 'targets' keyword arguments or a resolvable time-series file/HF dataset for '{dataset_name}'."
             )
         return TimeSeriesDatasetLoader(
             inputs=inputs,
