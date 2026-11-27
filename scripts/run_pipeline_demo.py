@@ -1,0 +1,572 @@
+"""
+AdverScan — End-to-End Interactive Security Assessment Demo & CLI.
+
+Provides both an interactive prompt menu and command-line execution for the complete AdverScan framework:
+M1 Model Ingestion -> M2 Baseline Evaluation -> M3 Attack Engine
+-> M2 Adversarial Evaluation -> M5 Vulnerability Analysis -> M6 XAI -> M7 Hardening
+-> M8 Re-Test & Comparison -> M9 Security Report Generator.
+"""
+
+import argparse
+import json
+import sys
+import os
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", message=".*number of unique classes is greater than 50%.*")
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import time
+from typing import List, Tuple , Optional
+import torch
+from huggingface_hub import hf_hub_download
+from transformers import AutoModelForImageClassification, ViTConfig
+
+from app.attack_engine import discover_attacks, list_attacks
+from app.evaluation.dataset_loader import GTSRBDatasetLoader
+from app.orchestration import AdverScanOrchestrator, PipelineConfig
+from app.utils import resolve_device, get_execution_device_info, load_gtsrb_vit_model, patch_hf_config
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="AdverScan End-to-End Interactive Security Assessment Demo & CLI"
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        default=False,
+        help="Force interactive mode menu prompt",
+    )
+    parser.add_argument(
+        "--no-interactive",
+        action="store_true",
+        default=False,
+        help="Disable interactive menu prompt and use CLI arguments",
+    )
+    parser.add_argument(
+        "--samples",
+        type=str,
+        default="2000",
+        help="Number of samples to evaluate (int or 'full' for full dataset).",
+    )
+    parser.add_argument(
+        "--attacks",
+        nargs="+",
+        default=["fgsm"],
+        help="Attacks to execute (e.g. fgsm pgd deepfool)",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="full",
+        choices=["baseline_only", "attack_assessment", "full"],
+        help="Execution mode (baseline_only, attack_assessment, full)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Execution device ('auto', 'cpu' or 'cuda'). Default auto-detects GPU if available.",
+    )
+    parser.add_argument(
+        "--enable-xai",
+        action="store_true",
+        default=False,
+        help="Enable M6 XAI explainability",
+    )
+    parser.add_argument(
+        "--xai-techniques",
+        nargs="+",
+        default=["shap"],
+        help="XAI techniques to apply (shap, lime)",
+    )
+    parser.add_argument(
+        "--enable-hardening",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable M7 Hardening Engine",
+    )
+    parser.add_argument(
+        "--defense",
+        type=str,
+        default="auto",
+        help="Hardening defense type (spatial_smoothing, randomized_smoothing, adversarial_training, auto)",
+    )
+    parser.add_argument(
+        "--enable-retest",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable M8 Re-Test & Comparison Engine (default: True)",
+    )
+    parser.add_argument(
+        "--enable-report",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable M9 Security Report Generator Engine (default: True)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="results/orchestration",
+        help="Output directory for generated security reports (default: 'results/orchestration')",
+    )
+    return parser.parse_args()
+
+
+def prompt_user_selection():
+    print("=" * 70)
+    print("                 ADVERSCAN SECURITY ASSESSMENT DEMO                 ")
+    print("=" * 70)
+
+    # 1. Model Selection
+    print("\nAvailable Models:")
+    print("  1. bazyl/gtsrb-model (Vision Transformer - GTSRB Traffic Sign Classifier)")
+    model_choice = input("Select model [1]: ").strip() or "1"
+    if model_choice == "1":
+        model_name = "bazyl/gtsrb-model"
+    else:
+        model_name = model_choice  # Allow custom HF model path string if supplied
+
+    # 2. Dataset Selection
+    print("\nAvailable Datasets:")
+    print("  1. bazyl/GTSRB (German Traffic Sign Recognition Benchmark)")
+    dataset_choice = input("Select dataset [1]: ").strip() or "1"
+    if dataset_choice == "1":
+        dataset_name = "bazyl/GTSRB"
+    else:
+        dataset_name = dataset_choice
+
+    # 3. Sample Count
+    while True:
+        samples_str = input("\nNumber of samples to evaluate [2000] (enter 0 or 'all' for full 12,630 dataset): ").strip().lower() or "2000"
+        if samples_str in ["0", "all", "full"]:
+            samples_count = 0  # 0 indicates full dataset evaluation
+            break
+        try:
+            samples_count = int(samples_str)
+            if samples_count > 0:
+                break
+            print("  ❌ Please enter a positive integer greater than 0, or '0'/'all' for full dataset.")
+        except ValueError:
+            print("  ❌ Invalid input. Please enter a number, '0', or 'all'.")
+
+    # 4. Discover Attacks from M3
+    discover_attacks()
+    available_attacks = list_attacks()  # ['deepfool', 'fgsm', 'pgd']
+    print("\nAvailable Adversarial Attacks (M3 Attack Engine):")
+    for idx, atk in enumerate(available_attacks, 1):
+        print(f"  {idx}. {atk.upper()}")
+    print("  M. Multiple / All attacks")
+
+    atk_input = input("Select attack(s) (e.g. '1', '1 2', 'all') [1]: ").strip().lower() or "1"
+    selected_attacks: List[str] = []
+
+    if atk_input in ["m", "all", "all attacks"]:
+        selected_attacks = available_attacks
+    else:
+        for token in atk_input.split():
+            if token.isdigit():
+                num = int(token)
+                if 1 <= num <= len(available_attacks):
+                    selected_attacks.append(available_attacks[num - 1])
+            elif token in available_attacks:
+                selected_attacks.append(token)
+
+    if not selected_attacks:
+        print("  ⚠️ No valid attack recognized; defaulting to FGSM.")
+        selected_attacks = ["fgsm"]
+
+    # 5. XAI Selection
+    enable_xai_str = input("\nEnable M6 XAI Explainability? [y/N]: ").strip().lower()
+    enable_xai = enable_xai_str in ["y", "yes", "true", "1"]
+    selected_xai: List[str] = []
+    if enable_xai:
+        print("\nAvailable XAI Techniques:")
+        print("  1. SHAP (SHapley Additive exPlanations)")
+        print("  2. LIME (Local Interpretable Model-agnostic Explanations)")
+        print("  3. Both (SHAP & LIME)")
+        xai_choice = input("Select XAI technique [1]: ").strip() or "1"
+        if xai_choice == "2":
+            selected_xai = ["lime"]
+        elif xai_choice == "3":
+            selected_xai = ["shap", "lime"]
+        else:
+            selected_xai = ["shap"]
+
+    # 6. Hardening Selection
+    enable_hard_str = input("\nEnable M7 Hardening Engine? [y/N]: ").strip().lower()
+    enable_hardening = enable_hard_str in ["y", "yes", "true", "1"]
+    selected_defense = "auto"
+    if enable_hardening:
+        print("\nAvailable Hardening Defenses:")
+        print("  1. Spatial Smoothing (spatial_smoothing)")
+        print("  2. Bit Depth Reduction (bit_depth_reduction)")
+        print("  3. JPEG Compression (jpeg_compression)")
+        print("  4. Randomized Smoothing (randomized_smoothing)")
+        print("  5. Adversarial Training (adversarial_training)")
+        print("  6. Auto Selection (auto)")
+        print("  7. Iterative Selection & Evaluation Loop (iterative)")
+        def_choice = input("Select defense [7]: ").strip() or "7"
+        def_map = {
+            "1": "spatial_smoothing",
+            "2": "bit_depth_reduction",
+            "3": "jpeg_compression",
+            "4": "randomized_smoothing",
+            "5": "adversarial_training",
+            "6": "auto",
+            "7": "iterative",
+        }
+        selected_defense = def_map.get(def_choice, "iterative")
+
+    # 7. Re-Test & Comparison Selection (M8)
+    enable_retest_str = input("\nEnable M8 Re-Test & Comparison Engine? [Y/n]: ").strip().lower() or "y"
+    enable_retest = enable_retest_str in ["y", "yes", "true", "1"]
+
+    # 8. Report Generator Selection (M9)
+    enable_report_str = input("\nEnable M9 Security Report Generator Engine? [Y/n]: ").strip().lower() or "y"
+    enable_report = enable_report_str in ["y", "yes", "true", "1"]
+
+    # 9. Pipeline Execution Mode Selection
+    print("\nExecution Modes:")
+    print("  1. Baseline Only (M1 → M2)")
+    print("  2. Attack Assessment (M1 → M2 → M3 → M2_Adv → M5)")
+    print("  3. Full Security Assessment (M1 → M2 → M3 → M2_Adv → M5 → M6 / M7 / M8 / M9)")
+    mode_choice = input("Select mode [3]: ").strip() or "3"
+    mode_map = {
+        "1": "baseline_only",
+        "2": "attack_assessment",
+        "3": "full",
+    }
+    selected_mode = mode_map.get(mode_choice, "full")
+
+    # 10. Device Selection
+    dev_info = get_execution_device_info("auto")
+    print("\nTarget Execution Device:")
+    if dev_info["gpu_available"]:
+        print(f"  1. Auto-detect [CUDA / GPU ({dev_info['gpu_model']})] (Default)")
+        print("  2. CPU")
+    else:
+        print("  1. Auto-detect [CPU (CUDA unavailable)] (Default)")
+        print("  2. CPU")
+
+    dev_choice = input("Select device [1]: ").strip() or "1"
+    selected_device = "cpu" if dev_choice == "2" else resolve_device("auto")
+
+    return {
+        "model_name": model_name,
+        "dataset_name": dataset_name,
+        "samples": samples_count,
+        "attacks": selected_attacks,
+        "enable_xai": enable_xai,
+        "xai_techniques": selected_xai,
+        "enable_hardening": enable_hardening,
+        "defense": selected_defense,
+        "enable_retest": enable_retest,
+        "enable_report": enable_report,
+        "mode": selected_mode,
+        "device": selected_device,
+        "output_dir": "results/orchestration",
+    }
+
+
+def print_summary_box(opts: dict):
+    print("\n" + "=" * 70)
+    print("                 ADVERSCAN CONFIGURATION SUMMARY                    ")
+    print("=" * 70)
+    print(f"Model Identifier:       {opts['model_name']}")
+    print(f"Dataset Identifier:     {opts['dataset_name']}")
+    print(f"Evaluated Samples:      {opts['samples']}")
+    print(f"Target Device:          {opts['device']}")
+    print(f"Pipeline Mode:          {opts['mode']}")
+    print(f"Selected Attacks:       {', '.join(opts['attacks']).upper()}")
+    print(f"XAI Enabled:            {opts['enable_xai']} {opts['xai_techniques'] if opts['enable_xai'] else ''}")
+    print(f"Hardening Enabled:      {opts['enable_hardening']} (Defense: {opts['defense'] if opts['enable_hardening'] else 'N/A'})")
+    print(f"M8 Re-Test Enabled:     {opts['enable_retest']}")
+    print(f"M9 Report Enabled:      {opts['enable_report']}")
+    print(f"Output Directory:       {opts.get('output_dir', 'results/orchestration')}")
+    print("=" * 70)
+
+
+def main():
+    
+    total_demo_start = time.time()
+    args = parse_args()
+
+    # Resolve and display execution device
+    resolved_dev = resolve_device(args.device)
+    print(f"[Debug] Requested device: {args.device} -> Resolved device: {resolved_dev}")
+    args.device = resolved_dev
+    # Convert sample count argument to integer, handling 'full'/'all'/'0' as full dataset
+    if isinstance(args.samples, str):
+        samples_str = args.samples.lower()
+        if samples_str in ("full", "all", "0"):
+            args.samples = 0  # 0 indicates full dataset evaluation
+        else:
+            try:
+                args.samples = int(samples_str)
+            except ValueError:
+                print(f"  ❌ Invalid sample count '{args.samples}', defaulting to 2000.")
+                args.samples = 2000
+
+    # Determine whether interactive mode should run
+    # Interactive runs if no args are passed or if --interactive flag is explicitly passed
+    is_interactive = args.interactive or (len(sys.argv) == 1)
+    if args.no_interactive:
+        is_interactive = False
+
+    if is_interactive:
+        opts = prompt_user_selection()
+        print_summary_box(opts)
+        confirm = input("Start security assessment? [Y/n]: ").strip().lower()
+        if confirm in ["n", "no"]:
+            print("  Assessment cancelled by user.")
+            sys.exit(0)
+    else:
+        opts = {
+            "model_name": "bazyl/gtsrb-model",
+            "dataset_name": "bazyl/GTSRB",
+            "samples": args.samples,
+            "attacks": [a.lower() for a in args.attacks],
+            "enable_xai": args.enable_xai,
+            "xai_techniques": [t.lower() for t in args.xai_techniques],
+            "enable_hardening": args.enable_hardening,
+            "defense": args.defense.lower(),
+            "enable_retest": args.enable_retest,
+            "enable_report": args.enable_report,
+            "output_dir": args.output_dir,
+            "mode": args.mode.lower(),
+            "device": resolve_device(args.device),
+        }
+        print_summary_box(opts)
+
+    # 1. Load HuggingFace PyTorch Model
+    model_name: str = str(opts.get("model_name", "bazyl/gtsrb-model"))
+    dataset_name: str = str(opts.get("dataset_name", "bazyl/GTSRB"))
+    device: str = str(opts.get("device", "cpu"))
+    raw_samples = opts.get("samples", 2000)
+    samples_count: int = int(raw_samples) if isinstance(raw_samples, (int, str)) and str(raw_samples).isdigit() else (int(raw_samples) if isinstance(raw_samples, int) else 0)
+    mode_val: str = str(opts.get("mode", "full"))
+    raw_attacks = opts.get("attacks", ["fgsm"])
+    attacks_val: List[str] = [str(a) for a in raw_attacks] if isinstance(raw_attacks, list) else [str(raw_attacks)]
+    enable_xai_val: bool = bool(opts.get("enable_xai", False))
+    raw_xai = opts.get("xai_techniques", ["shap"])
+    xai_techniques_val: List[str] = [str(t) for t in raw_xai] if isinstance(raw_xai, list) else [str(raw_xai)]
+    enable_hardening_val: bool = bool(opts.get("enable_hardening", False))
+    defense_val: str = str(opts.get("defense", "auto"))
+    enable_retest_val: bool = bool(opts.get("enable_retest", True))
+    enable_report_val: bool = bool(opts.get("enable_report", True))
+    raw_out = opts.get("output_dir")
+    output_dir_val: Optional[str] = str(raw_out) if raw_out is not None else None
+
+    print(f"\n[1/3] Ingesting PyTorch model '{model_name}' on device '{device}'...")
+    try:
+        if model_name == "bazyl/gtsrb-model":
+            raw_model, model_config = load_gtsrb_vit_model(model_name)
+        else:
+            config_path = hf_hub_download(model_name, "config.json")
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg_dict = json.load(f)
+            cfg_dict = patch_hf_config(cfg_dict)
+            model_config = ViTConfig.from_dict(cfg_dict)
+            raw_model = AutoModelForImageClassification.from_pretrained(
+                model_name, config=model_config, use_safetensors=True
+            )
+    except Exception as e:
+        print(f"  ❌ Error loading model '{model_name}': {e}")
+        sys.exit(1)
+
+    # 2. Setup Dataset Loader for sample count
+    if samples_count <= 0:
+        split_str = "test"  # Full dataset (12,630 samples)
+    else:
+        split_str = f"test[:{samples_count}]"
+    batch_size = 32
+    print(f"[2/3] Loading dataset split '{split_str}' from '{dataset_name}' (batch size: {batch_size})...")
+    try:
+        dataset_loader = GTSRBDatasetLoader(
+            dataset_name=dataset_name,
+            processor_name=model_name,
+            split=split_str,
+            batch_size=batch_size,
+        )
+    except Exception as e:
+        print(f"  ❌ Error loading dataset '{dataset_name}': {e}")
+        sys.exit(1)
+
+    # 3. Build PipelineConfig & Execute AdverScanOrchestrator
+    pipeline_config = PipelineConfig(
+        model_path=raw_model,
+        sample_input=torch.randn(1, 3, 224, 224),
+        device=device,
+        model_name="GTSRB_ViT_Demo",
+        num_classes=43,
+        mode=mode_val,
+        attacks=attacks_val,
+        enable_xai=enable_xai_val,
+        xai_techniques=xai_techniques_val,
+        enable_hardening=enable_hardening_val,
+        defense=defense_val,
+        enable_retest=enable_retest_val,
+        enable_report=enable_report_val,
+        output_dir=output_dir_val,
+        batch_size=batch_size,
+        custom_dataset_loader=dataset_loader,
+    )
+
+    print(f"[3/3] Executing AdverScanOrchestrator across pipeline (Mode: '{mode_val}')...\n")
+    orchestrator = AdverScanOrchestrator()
+    result = orchestrator.run(pipeline_config)
+
+    # Calculate Total Script Execution Time
+    total_demo_time = time.time() - total_demo_start
+    mins, secs = divmod(total_demo_time, 60)
+    time_fmt = f"{total_demo_time:.4f} seconds ({int(mins)}m {secs:.2f}s)" if mins > 0 else f"{total_demo_time:.4f} seconds"
+
+    # 4. Display Results Summary
+    print("=" * 70)
+    print("                 ADVERSCAN SECURITY ASSESSMENT RESULTS              ")
+    print("=" * 70)
+    print(f"Pipeline Status:          {result.status}")
+    print(f"Execution Mode:           {result.execution_mode}")
+    print(f"Orchestrator Exec Time:   {result.execution_time_seconds:.4f} seconds")
+    print(f"Total Pipeline Runtime:   {time_fmt}")
+    print(f"Timestamp:                {result.timestamp}")
+    print("\n------------------------------------------------------------")
+    print("M2 — BASELINE CLEAN EVALUATION")
+    print("------------------------------------------------------------")
+    if result.baseline_evaluation:
+        base_acc = result.baseline_evaluation.get("accuracy", 0.0)
+        base_conf = result.baseline_evaluation.get("average_confidence", 0.0)
+        f1_macro = result.baseline_evaluation.get("f1_macro", 0.0)
+        print(f"Clean Accuracy:           {base_acc * 100:.2f}%")
+        print(f"Clean Average Confidence: {base_conf * 100:.2f}%")
+        print(f"Macro F1-Score:           {f1_macro * 100:.2f}%")
+    else:
+        print("Baseline evaluation result unavailable.")
+
+    if result.attack_results:
+        print("\n------------------------------------------------------------")
+        print("M3 — ADVERSARIAL ATTACK ENGINE RESULTS")
+        print("------------------------------------------------------------")
+        for atk_name, atk_data in result.attack_results.items():
+            print(f"[{atk_name.upper()}] Class: {atk_data.get('attack_class')}")
+            print(f"    Execution Time:       {atk_data.get('execution_time_seconds', 0.0):.2f}s")
+            print(f"    Parameters:           {atk_data.get('parameters', {})}")
+
+    if result.vulnerability_analysis:
+        print("\n------------------------------------------------------------")
+        print("M5 — VULNERABILITY ANALYSIS & SCORING")
+        print("------------------------------------------------------------")
+        for atk_name, vuln in result.vulnerability_analysis.items():
+            sc = vuln.get("scoring", {})
+            ass = vuln.get("assessment", {})
+            asr = ass.get("attack_success_rate")
+            asr_str = f"{asr * 100:.2f}%" if asr is not None else "N/A"
+            print(f"[{atk_name.upper()}] Vulnerability Score: {sc.get('vulnerability_score', 0.0):.2f} / 100")
+            print(f"    Risk Level:           {sc.get('risk_level', 'UNKNOWN')}")
+            print(f"    Model Degradation:    {ass.get('model_degradation', 0.0) * 100:.2f}%")
+            print(f"    Attack Success Rate:  {asr_str}")
+            print(f"    Accuracy Drop:        {ass.get('accuracy_drop', 0.0) * 100:.2f}%")
+
+    print("\n------------------------------------------------------------")
+    print("M6 — XAI EXPLAINABILITY")
+    print("------------------------------------------------------------")
+    if result.xai_results:
+        def _fmt_pred(val, max_items=5):
+            if isinstance(val, (list, tuple)):
+                if len(val) > max_items:
+                    preview = ", ".join(map(str, val[:max_items]))
+                    return f"[{preview}, ...] ({len(val)} total samples)"
+                return str(val)
+            return str(val)
+
+        for xai_key, xai_res in result.xai_results.items():
+            print(f"[{xai_key.upper()}] Technique: {xai_res.get('technique')}")
+            print(f"    Prediction Changed:   {xai_res.get('prediction_changed')}")
+            print(f"    Attack Caused Failure:{xai_res.get('attack_caused_failure')}")
+            print(f"    Clean Prediction:     {_fmt_pred(xai_res.get('clean_prediction'))}")
+            print(f"    Adversarial Pred:     {_fmt_pred(xai_res.get('adversarial_prediction'))}")
+    else:
+        print("XAI: Disabled or not executed.")
+
+    print("\n------------------------------------------------------------")
+    print("M7 — HARDENING ENGINE & ITERATIVE SELECTION")
+    print("------------------------------------------------------------")
+    if result.hardening_results:
+        hard_meta = result.hardening_results.get("metadata", {})
+        selected_def = result.hardening_results.get("selected_defense") or hard_meta.get("defense_name")
+        print(f"Finally Selected Defense: {selected_def} ({hard_meta.get('defense_type')})")
+        print(f"Hardening Status:         {result.hardening_results.get('status')}")
+        print(f"Acceptance Satisfied:     {result.hardening_results.get('improvement_sufficient')}")
+        print(f"Total Attempts Evaluated: {result.hardening_results.get('num_attempts')}")
+        print(f"Hardened Model Class:     {result.hardening_results.get('hardened_model_class')}")
+
+        attempts = result.hardening_results.get("defense_attempts", [])
+        if attempts:
+            print("\n  Candidate Attempt Breakdown:")
+            for idx, att in enumerate(attempts, 1):
+                st_str = "ACCEPTED" if att.get("status") == "accepted" else ("INSUFFICIENT" if att.get("status") == "insufficient" else "HARMFUL")
+                print(f"  [{idx}] Defense '{att.get('defense_name')}': Status = {st_str}")
+                if att.get("vuln_score_improvement") is not None:
+                    print(f"      - Vulnerability Score Improvement: {att.get('vuln_score_improvement'):+.2f} pts")
+                if att.get("clean_accuracy_drop_pct_points") is not None:
+                    print(f"      - Clean Accuracy Drop:            {att.get('clean_accuracy_drop_pct_points'):.2f}%")
+                if att.get("reason"):
+                    print(f"      - Failure / Evaluation Reason:    {att.get('reason')}")
+                if att.get("status") != "accepted" and idx < len(attempts):
+                    next_def = attempts[idx].get("defense_name")
+                    print(f"      - Next Action:                    Applied '{next_def}' to test alternative defense technique.")
+
+            best_att = max(attempts, key=lambda a: (a.get("vuln_score_improvement") or 0.0, -(a.get("clean_accuracy_drop") or 0.0)))
+            print(f"\n  📈 Defense Technique that Improved Model Most: '{best_att.get('defense_name')}' "
+                  f"(Achieved {best_att.get('vuln_score_improvement', 0.0):+.2f} pts vulnerability reduction)")
+        if result.hardening_results.get("recommendations"):
+            print("\nRecommendations:")
+            for rec in result.hardening_results.get("recommendations", []):
+                print(f"  - {rec}")
+    else:
+        print("Hardening: Disabled or not executed.")
+
+    print("\n------------------------------------------------------------")
+    print("M8 — RE-TEST & COMPARISON ENGINE")
+    print("------------------------------------------------------------")
+    if result.retest_results:
+        print(f"Overall Improved:         {result.retest_results.get('overall_improved')}")
+        comparisons = result.retest_results.get("comparisons", {})
+        for atk_k, comp in comparisons.items():
+            print(f"[{atk_k.upper()}] Delta Vulnerability Score: {comp.get('delta_vulnerability_score', 0.0):.2f}")
+            print(f"    Delta Accuracy Drop:  {comp.get('delta_accuracy_drop', 0.0) * 100:.2f}%")
+            print(f"    Risk Level Before:    {comp.get('before_risk_level')}")
+            print(f"    Risk Level After:     {comp.get('after_risk_level')}")
+            print(f"    Is Vector Improved:   {comp.get('is_improved')}")
+    else:
+        print("Re-Test: Disabled or not executed.")
+
+    print("\n------------------------------------------------------------")
+    print("M9 — SECURITY REPORT GENERATOR")
+    print("------------------------------------------------------------")
+    if result.report_result:
+        print(f"Report ID:                {result.report_result.get('report_id')}")
+        print(f"Status:                   {result.report_result.get('status')}")
+        print(f"Risk Level:               {result.report_result.get('risk_level')}")
+        print(f"Vulnerability Score:      {result.report_result.get('vulnerability_score')}")
+        if result.report_result.get("recommendations"):
+            print("Recommendations:")
+            for rec in result.report_result.get("recommendations", []):
+                print(f"  - {rec}")
+    else:
+        print("Report Generator: Disabled or not executed.")
+
+    if result.errors:
+        print("\n------------------------------------------------------------")
+        print("ERRORS / WARNINGS LOGGED")
+        print("------------------------------------------------------------")
+        for err in result.errors:
+            print(f"❌ [{err.get('module')}] {err.get('error_type')}: {err.get('message')}")
+
+    print("=" * 70)
+    print("✅ AdverScan Security Assessment Demo Completed.")
+
+
+if __name__ == "__main__":
+    main()

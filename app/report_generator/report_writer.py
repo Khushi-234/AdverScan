@@ -1,0 +1,180 @@
+"""
+ReportWriter — Handles persisting an AdverScan ReportResult to disk.
+
+Writes the complete report to a scan-specific output folder inside the
+project-level ``reports/`` directory:
+
+    reports/<scan_id>/adverscan_report_<attacks>_<scan_id>.md     ← Markdown
+    reports/<scan_id>/adverscan_report_<attacks>_<scan_id>.json   ← JSON
+    reports/<scan_id>/adverscan_report_<attacks>_<scan_id>_timing.csv  ← CSV
+
+File stem is built from the actual attacks performed:
+  - Only PGD       →  adverscan_report_pgd_<scan_id>.md
+  - FGSM + PGD     →  adverscan_report_fgsm_pgd_<scan_id>.md
+  - FGSM+PGD+DF    →  adverscan_report_fgsm_pgd_deepfool_<scan_id>.md
+
+All output methods are optional — callers pick which formats to persist.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+from .report_result import ReportResult
+
+
+# Project-level reports/ directory: two levels up from this file
+# (app/report_generator/report_writer.py → app/ → project root)
+_DEFAULT_REPORTS_DIR = Path(__file__).resolve().parent.parent.parent / "reports"
+
+
+class ReportWriter:
+    """
+    Persists a ReportResult to a structured output directory.
+
+    By default, reports land in the project-level ``reports/`` folder:
+
+        reports/<scan_id>/adverscan_report_<attacks>_<scan_id>.md
+        reports/<scan_id>/adverscan_report_<attacks>_<scan_id>.json
+        reports/<scan_id>/adverscan_report_<attacks>_<scan_id>_timing.csv
+
+    The ``<attacks>`` segment is built from the actual attack names present
+    in the report result, preserving their insertion order:
+
+        # Only PGD ran:
+        writer.write(result)  →  reports/SCAN-XYZ/adverscan_report_pgd_scan-xyz.md
+
+        # FGSM + PGD ran:
+        writer.write(result)  →  reports/SCAN-XYZ/adverscan_report_fgsm_pgd_scan-xyz.md
+
+        # FGSM + PGD + DeepFool ran:
+        writer.write(result)  →  reports/SCAN-XYZ/adverscan_report_fgsm_pgd_deepfool_scan-xyz.md
+    """
+
+    def __init__(self, output_root: Union[str, Path, None] = None) -> None:
+        """
+        Args:
+            output_root: Root folder for all reports.
+                         Defaults to the project-level ``reports/`` directory.
+        """
+        self.output_root = Path(output_root) if output_root is not None else _DEFAULT_REPORTS_DIR
+
+    # ── Public API ─────────────────────────────────────────────────────────────
+
+    def write(
+        self,
+        result: ReportResult,
+        formats: Optional[List[str]] = None,
+    ) -> Dict[str, str]:
+        """
+        Write the report to disk in the requested formats.
+
+        Args:
+            result: Completed ReportResult from ReportGenerator.generate().
+            formats: List of output formats. Defaults to ["md", "json"].
+                     Supported: "md", "json", "csv", "txt".
+
+        Returns:
+            Dict mapping format name → absolute file path.
+        """
+        if formats is None:
+            formats = ["md", "json"]
+
+        # ── Output directory: reports/<scan_id>/ ───────────────────────────────
+        scan_id = result.scan_id or result.report_id
+        out_dir = self.output_root / scan_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── File stem: adverscan_report_<attacks>_<scan_id_lower> ─────────────
+        # Built from the actual attack names in the result.
+        # Avoids duplicate repetitions when scan_suffix already contains attacks_segment.
+        attack_names = list((result.attack_results or {}).keys())
+        attacks_segment = "_".join(name.lower() for name in attack_names) if attack_names else "scan"
+        scan_suffix = scan_id.lower().replace("-", "_")
+
+        if attacks_segment == "scan":
+            stem = f"adverscan_report_{scan_suffix}"
+        elif attacks_segment in scan_suffix:
+            # e.g., scan_id="SCAN-FGSM-123456" -> scan_suffix="scan_fgsm_123456" -> "fgsm_123456"
+            file_suffix = scan_suffix[5:] if scan_suffix.startswith("scan_") else scan_suffix
+            stem = f"adverscan_report_{file_suffix}"
+        else:
+            stem = f"adverscan_report_{attacks_segment}_{scan_suffix}"
+
+        written: Dict[str, str] = {}
+
+        for fmt in formats:
+            fmt = fmt.lower().strip()
+            try:
+                if fmt in ("md", "markdown"):
+                    path = out_dir / f"{stem}.md"
+                    self._write_markdown(result, path)
+                    written["md"] = str(path.resolve())
+                elif fmt == "json":
+                    path = out_dir / f"{stem}.json"
+                    self._write_json(result, path)
+                    written["json"] = str(path.resolve())
+                elif fmt == "csv":
+                    path = out_dir / f"{stem}_timing.csv"
+                    self._write_csv(result, path)
+                    written["csv"] = str(path.resolve())
+                elif fmt in ("txt", "text"):
+                    path = out_dir / f"{stem}.txt"
+                    self._write_text(result, path)
+                    written["txt"] = str(path.resolve())
+                elif fmt == "pdf":
+                    path = out_dir / f"{stem}.pdf"
+                    pdf_ok = self._write_pdf(result, path)
+                    if pdf_ok:
+                        written["pdf"] = str(path.resolve())
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ⚠ ReportWriter: Failed to write '{fmt}' — {exc}")
+
+        if written:
+            print(f"\n📁 Report saved → {out_dir.resolve()}/")
+            for fmt, p in written.items():
+                print(f"   [{fmt.upper():>4}] {Path(p).name}")
+
+        return written
+
+    # ── Format Writers ─────────────────────────────────────────────────────────
+
+    def _write_markdown(self, result: ReportResult, path: Path) -> None:
+        """Write the formatted Markdown / text report."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(result.formatted_report)
+
+    def _write_text(self, result: ReportResult, path: Path) -> None:
+        """Write the plain text report (same content as Markdown)."""
+        self._write_markdown(result, path)
+
+    def _write_json(self, result: ReportResult, path: Path) -> None:
+        """Write the full report as a structured JSON file."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(result.to_dict(), f, indent=2, default=str)
+
+    def _write_csv(self, result: ReportResult, path: Path) -> None:
+        """Write a per-module execution timing CSV."""
+        result.save_csv(path)
+
+    def _write_pdf(self, result: ReportResult, path: Path) -> bool:
+        """
+        Write the report as a publication-grade PDF document using ReportLab Platypus.
+        Returns True if successful, False if no PDF engine is installed or generation fails.
+        """
+        try:
+            from .pdf_generator import compile_pdf_report
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+            compile_pdf_report(result, target_path=path)
+            return True
+        except ImportError:
+            return False
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ⚠ ReportWriter: Failed to write PDF — {exc}")
+            return False

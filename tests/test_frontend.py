@@ -1,0 +1,2365 @@
+"""
+Tests for AdverScan Frontend Services:
+- Defense Service (Module 7 & Module 8 integration)
+- Report Service (Module 9 integration)
+- Session State Workflow Management
+"""
+
+import pytest
+import torch
+import torch.nn as nn
+
+from frontend.services.defense_service import (
+    DOMAIN_DEFENSE_CATALOG,
+    execute_configured_defense,
+    get_available_defenses_for_domain,
+)
+from frontend.services.xai_service import explain_assessment
+from frontend.services.report_service import generate_security_report
+from frontend.utils.session_state import (
+    get_workflow_stage,
+    init_session_state,
+    reset_workflow_state,
+    set_defense_result,
+    get_defense_result,
+    set_report_result,
+    get_report_result,
+    set_workflow_stage,
+)
+
+
+class SimpleVisionModel(nn.Module):
+    """Simple 2D CNN model for testing image defenses."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 8, kernel_size=3, padding=1)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(8, 2)
+
+    def forward(self, x):
+        h = torch.relu(self.conv(x))
+        h = self.pool(h).flatten(1)
+        return self.fc(h)
+
+
+def test_get_available_defenses_for_domain():
+    """Verify domain-specific defense catalogs."""
+    img_defenses = get_available_defenses_for_domain("image")
+    assert len(img_defenses) >= 4
+    def_ids = [d["id"] for d in img_defenses]
+    assert "auto" in def_ids
+    assert "spatial_smoothing" in def_ids
+    assert "randomized_smoothing" in def_ids
+
+    tab_defenses = get_available_defenses_for_domain("tabular")
+    assert any(d["id"] == "auto" for d in tab_defenses)
+    assert any(d["id"] == "feature_squeezing" for d in tab_defenses)
+
+    txt_defenses = get_available_defenses_for_domain("nlp")
+    assert any(d["id"] == "confidence_rejection" for d in txt_defenses)
+
+
+def test_execute_configured_defense_specific():
+    """Verify specific defense execution with real tensors."""
+    model = SimpleVisionModel()
+    inputs = torch.rand(4, 3, 16, 16)
+    labels = torch.tensor([0, 1, 0, 1])
+    adv_inputs = inputs + 0.05 * torch.randn_like(inputs)
+
+    attack_res = {
+        "attack_name": "fgsm",
+        "clean_accuracy": 100.0,
+        "adversarial_accuracy": 25.0,
+        "asr_percentage": 75.0,
+        "clean_confidence": 95.0,
+        "adversarial_confidence": 60.0,
+        "confidence_drop": 35.0,
+        "total_samples": 4,
+        "original_predictions": [0, 1, 0, 1],
+        "adversarial_predictions": [1, 0, 1, 1],
+    }
+
+    result = execute_configured_defense(
+        model=model,
+        domain="image",
+        defense_choice="spatial_smoothing",
+        test_inputs=inputs,
+        test_labels=labels,
+        adversarial_examples=adv_inputs,
+        attack_result=attack_res,
+        fallback_to_best=True,
+        custom_params={"kernel_size": 3},
+    )
+
+    assert result is not None
+    assert result["selected_defense"] == "spatial_smoothing"
+    assert "after_clean_accuracy" in result
+    assert "after_adv_accuracy" in result
+    assert "asr_reduction_percentage" in result
+    assert len(result["sample_restorations"]) == 4
+    assert result["_hardened_model"] is not None
+
+
+def test_execute_configured_defense_auto_and_fallback():
+    """Verify auto iterative defense execution with fallback."""
+    model = SimpleVisionModel()
+    inputs = torch.rand(4, 3, 16, 16)
+    labels = torch.tensor([0, 1, 0, 1])
+    adv_inputs = inputs + 0.08 * torch.randn_like(inputs)
+
+    attack_res = {
+        "attack_name": "pgd",
+        "clean_accuracy": 100.0,
+        "adversarial_accuracy": 0.0,
+        "asr_percentage": 100.0,
+        "total_samples": 4,
+        "original_predictions": [0, 1, 0, 1],
+        "adversarial_predictions": [1, 0, 1, 0],
+    }
+
+    result = execute_configured_defense(
+        model=model,
+        domain="image",
+        defense_choice="auto",
+        test_inputs=inputs,
+        test_labels=labels,
+        adversarial_examples=adv_inputs,
+        attack_result=attack_res,
+        fallback_to_best=True,
+    )
+
+    assert result is not None
+    assert result["selected_defense"] is not None
+    assert len(result["candidate_attempts"]) > 0
+
+
+def test_generate_security_report_end_to_end():
+    """Verify 15-section report generation, markdown formatting, and JSON serialization."""
+    model_meta = {
+        "Model Name": "TestResNet",
+        "Architecture": "ResNet-18",
+        "Framework": "PyTorch",
+        "Total Parameters": 11200000,
+        "Trainable Parameters": 11200000,
+        "Input Shape": "[3, 32, 32]",
+        "Classes": 10,
+        "device": "cpu",
+    }
+    dataset_info = {
+        "dataset_name": "CIFAR-10 Test",
+        "total_samples": 10,
+    }
+    attack_result = {
+        "attack_name": "FGSM",
+        "clean_accuracy": 100.0,
+        "adversarial_accuracy": 20.0,
+        "asr_percentage": 80.0,
+        "clean_confidence": 92.5,
+        "confidence_drop": 30.0,
+        "execution_time": 0.45,
+        "total_samples": 10,
+        "epsilon_used": 0.05,
+    }
+    defense_result = {
+        "selected_defense": "spatial_smoothing",
+        "status": "ACCEPTED",
+        "improvement_sufficient": True,
+        "fallback_used": False,
+        "before_asr": 80.0,
+        "after_asr": 30.0,
+        "before_clean_accuracy": 100.0,
+        "after_clean_accuracy": 98.0,
+        "before_adv_accuracy": 20.0,
+        "after_adv_accuracy": 70.0,
+        "before_vulnerability_score": 80.0,
+        "after_vulnerability_score": 30.0,
+        "vulnerability_improvement": 50.0,
+        "candidate_attempts": [
+            {
+                "Defense": "Spatial Smoothing",
+                "Status": "ACCEPTED",
+                "ASR Reduction": "50.0%",
+                "Vuln Improvement": "+50.0 pts",
+                "Clean Acc Drop": "2.0%",
+                "Details": "Met all criteria",
+            }
+        ],
+        "recommendations": ["Deploy spatial smoothing filter in production."],
+    }
+
+    report = generate_security_report(
+        model_metadata=model_meta,
+        dataset_info=dataset_info,
+        attack_result=attack_result,
+        defense_result=defense_result,
+        domain="image",
+    )
+
+    assert report is not None
+    assert report.report_id is not None
+    assert report.risk_level in ("LOW", "MEDIUM", "HIGH", "CRITICAL")
+    assert report.vulnerability_score is not None
+
+    # Verify Markdown export
+    md_text = report.formatted_report
+    assert len(md_text) > 100
+    assert "TestResNet" in md_text
+
+    # Verify JSON export
+    json_str = report.to_json()
+    assert "report_id" in json_str
+    assert "model_info" in json_str
+
+
+def test_session_state_workflow_transitions():
+    """Verify session state stages including defense and report."""
+    init_session_state()
+
+    set_workflow_stage("defense_config")
+    assert get_workflow_stage() == "defense_config"
+
+    set_workflow_stage("defense_results")
+    assert get_workflow_stage() == "defense_results"
+
+    set_workflow_stage("report")
+    assert get_workflow_stage() == "report"
+
+    # Test defense result caching
+    mock_def = {"selected_defense": "spatial_smoothing", "status": "ACCEPTED"}
+    set_defense_result(mock_def)
+    assert get_defense_result() == mock_def
+
+    # Test report caching
+    mock_rep = {"report_id": "REP-12345", "status": "SUCCESS"}
+    set_report_result(mock_rep)
+    assert get_report_result() == mock_rep
+
+    # Reset
+    reset_workflow_state()
+    assert get_workflow_stage() == "dashboard"
+    assert get_defense_result() is None
+    assert get_report_result() is None
+
+
+def test_theme_manager_initialization(monkeypatch):
+    """Verify theme manager synchronization with native theme context."""
+    from frontend.utils.theme_manager import initialize_theme, load_theme
+    import streamlit as st
+
+    # 1. Test default dark theme
+    if "theme" in st.session_state:
+        del st.session_state["theme"]
+    t = initialize_theme()
+    assert t in ("Dark", "Light")
+    assert st.session_state["theme"] == t
+
+    # 2. Test explicit Light theme loading
+    st.session_state["theme"] = "Light"
+    t_light = initialize_theme()
+    assert t_light == "Light"
+
+    # 3. Test load_theme execution
+    load_theme("Dark")
+    load_theme("Light")
+
+
+def test_targeted_attack_execution_and_propagation():
+    """Verify targeted attack configuration, parameter propagation, and outcome classification (A01, A02, A03, A04)."""
+    from frontend.services.attack_service import execute_configured_attack
+
+    model = SimpleVisionModel()
+    inputs = torch.rand(4, 3, 16, 16)
+    labels = torch.tensor([0, 0, 0, 0])
+
+    params = {
+        "targeted": True,
+        "target_label": 1,
+    }
+
+    result = execute_configured_attack(
+        model=model,
+        attack_name="fgsm",
+        inputs=inputs,
+        labels=labels,
+        epsilon=0.1,
+        clip_min=0.0,
+        clip_max=1.0,
+        params=params,
+    )
+
+    assert result is not None
+    assert result["is_targeted"] is True
+    assert result["target_label"] == 1
+    assert "parameters_used" in result
+    assert result["parameters_used"]["targeted"] is True
+    assert result["parameters_used"]["target_label"] == 1
+    assert "sample_comparisons" in result
+    assert len(result["sample_comparisons"]) == 4
+
+
+def test_asr_denominator_and_clean_misclassification_handling():
+    """Verify ASR excludes cleanly misclassified samples from denominator (A06, A07)."""
+    from frontend.services.attack_service import execute_configured_attack
+
+    model = SimpleVisionModel()
+    inputs = torch.rand(4, 3, 16, 16)
+    
+    # Get model's clean predictions and invert them so all samples are cleanly misclassified
+    with torch.no_grad():
+        preds = model(inputs).argmax(dim=-1)
+    labels = 1 - preds  # labels are valid (0 or 1) but opposite to clean predictions
+
+    result = execute_configured_attack(
+        model=model,
+        attack_name="fgsm",
+        inputs=inputs,
+        labels=labels,
+        epsilon=0.05,
+    )
+
+    assert result["clean_accuracy"] == 0.0
+    assert result["clean_correct_count"] == 0
+    # ASR is undefined and 0.0 when 0 clean samples are correct
+    assert result["asr_undefined"] is True
+    assert result["asr_percentage"] == 0.0
+
+
+def test_defense_service_rejects_missing_adversarial_tensor():
+    """Verify defense execution never substitutes clean inputs for missing adversarial examples (A08)."""
+    model = SimpleVisionModel()
+    inputs = torch.rand(4, 3, 16, 16)
+    labels = torch.tensor([0, 1, 0, 1])
+
+    attack_res = {
+        "attack_name": "fgsm",
+        "clean_accuracy": 100.0,
+        "adversarial_accuracy": 0.0,
+        "asr_percentage": 100.0,
+        "total_samples": 4,
+    }
+
+    with pytest.raises(ValueError, match="Adversarial examples tensor is missing"):
+        execute_configured_defense(
+            model=model,
+            domain="image",
+            defense_choice="spatial_smoothing",
+            test_inputs=inputs,
+            test_labels=labels,
+            adversarial_examples=None,
+            attack_result=attack_res,
+        )
+
+
+def test_vulnerability_service_authentic_scoring_and_explanations():
+    """Verify authentic M5 VulnerabilityEngine assessment and scoring (A11, A12, A13, A14)."""
+    from frontend.services.vulnerability_service import assess_and_score_vulnerability
+
+    model = SimpleVisionModel()
+    inputs = torch.rand(4, 3, 16, 16)
+    labels = torch.tensor([0, 1, 0, 1])
+    adv_inputs = inputs + 0.08 * torch.randn_like(inputs)
+
+    attack_result = {
+        "attack_name": "FGSM",
+        "attack_class": "FGSM",
+        "execution_time": 0.12,
+        "total_samples": 4,
+        "clean_accuracy": 100.0,
+        "adversarial_accuracy": 25.0,
+        "asr_percentage": 75.0,
+        "clean_confidence": 92.0,
+        "adversarial_confidence": 55.0,
+        "confidence_drop": 37.0,
+        "original_predictions": [0, 1, 0, 1],
+        "adversarial_predictions": [1, 1, 1, 1],
+        "perturbation_metrics": {"linf": 0.08, "l2": 0.25, "l0": 100},
+        "_adversarial_examples": adv_inputs,
+        "epsilon_used": 0.08,
+    }
+
+    vuln_res = assess_and_score_vulnerability(
+        model=model,
+        attack_result=attack_result,
+        inputs=inputs,
+        labels=labels,
+        domain="image",
+    )
+
+    assert vuln_res is not None
+    assert "vulnerability_score" in vuln_res
+    assert vuln_res["risk_level"] in ("LOW", "MEDIUM", "HIGH", "CRITICAL")
+    assert "sub_scores" in vuln_res
+    assert "asr_score" in vuln_res["sub_scores"]
+    assert "degradation_score" in vuln_res["sub_scores"]
+    assert "stealth_score" in vuln_res["sub_scores"]
+    assert "metric_explanations" in vuln_res
+    assert "summary" in vuln_res["metric_explanations"]
+    assert "asr_component" in vuln_res["metric_explanations"]
+    assert "degradation_component" in vuln_res["metric_explanations"]
+    assert "stealth_component" in vuln_res["metric_explanations"]
+    assert "risk_rationale" in vuln_res["metric_explanations"]
+
+
+def test_synthetic_dataset_fallback_flagging():
+    """Verify synthetic fallback clearly marks dataset as synthetic (A05)."""
+    from frontend.services.ingestion_service import load_model_and_dataset
+
+    model = SimpleVisionModel()
+    # Attempting to load non-existent dataset will trigger synthetic fallback
+    res = load_model_and_dataset(
+        model_identifier=model,
+        dataset_name="non_existent_dataset_abc_123",
+        data_domain="image",
+        sample_size=4,
+    )
+
+    assert res["is_synthetic_dataset"] is True
+    assert "Synthetic Fallback" in res["dataset_name"]
+    assert res["telemetry"]["is_synthetic_dataset"] is True
+    assert res["telemetry"]["dataset_source"] == "synthetic_fallback"
+
+
+def test_report_service_no_fabricated_values():
+    """Verify reports use measured values and do not fabricate loss or stealth metrics (A15)."""
+    model_meta = {"Model Name": "M", "Architecture": "A", "Framework": "PyTorch"}
+    dataset_info = {"dataset_name": "D", "total_samples": 4}
+    attack_result = {
+        "attack_name": "FGSM",
+        "clean_accuracy": 100.0,
+        "adversarial_accuracy": 0.0,
+        "asr_percentage": 100.0,
+        "perturbation_metrics": {"linf": 0.05},
+        "total_samples": 4,
+    }
+
+    report = generate_security_report(
+        model_metadata=model_meta,
+        dataset_info=dataset_info,
+        attack_result=attack_result,
+        domain="image",
+    )
+
+    # Verify baseline performance loss is "Not Measured" when not provided, not 0.25
+    assert report.baseline_performance.get("loss") == "Not Measured"
+    # Verify report contains valid vulnerability score
+    assert report.vulnerability_score is not None
+
+
+def test_session_state_vulnerability_result():
+    """Verify session state holds and retrieves vulnerability results (A13)."""
+    from frontend.utils.session_state import (
+        get_vulnerability_result,
+        set_vulnerability_result,
+    )
+
+    mock_vuln = {"vulnerability_score": 72.5, "risk_level": "HIGH"}
+    set_vulnerability_result(mock_vuln)
+    assert get_vulnerability_result() == mock_vuln
+
+
+def test_vulnerability_recommendations_generation():
+    """Verify vulnerability recommendations are generated with proper metadata."""
+    from frontend.services.vulnerability_service import (
+        generate_vulnerability_recommendations,
+    )
+
+    # Test untargeted image domain
+    recs_img = generate_vulnerability_recommendations(
+        domain="image",
+        attack_name="FGSM",
+        vuln_score=85.0,
+        risk_level="CRITICAL",
+        asr=90.0,
+        is_targeted=False,
+    )
+    assert len(recs_img) >= 3
+    for r in recs_img:
+        assert "category" in r
+        assert "icon" in r
+        assert "title" in r
+        assert "priority" in r
+        assert "description" in r
+        assert len(r["description"]) > 10
+
+    # Test targeted tabular domain
+    recs_tab = generate_vulnerability_recommendations(
+        domain="tabular",
+        attack_name="HopSkipJump",
+        vuln_score=65.0,
+        risk_level="HIGH",
+        asr=75.0,
+        is_targeted=True,
+    )
+    assert len(recs_tab) >= 4
+    # Targeted recommendation should be first
+    assert recs_tab[0]["category"] == "Targeted Threat Defense"
+    assert recs_tab[0]["priority"] == "Urgent"
+
+
+def test_no_bar_charts_in_stage_4_attack_results():
+    """Verify that unnecessary bar charts have been removed from attack results stage."""
+    from pathlib import Path
+
+    app_code = Path("frontend/streamlit_app.py").read_text(encoding="utf-8")
+    # Find the attack_results stage block
+    stage_start = app_code.find('stage == "attack_results":')
+    stage_end = app_code.find('stage == "defense_config":')
+    assert stage_start != -1 and stage_end != -1
+
+    stage_code = app_code[stage_start:stage_end]
+    # Verify no st.bar_chart calls are present in stage 4
+    assert "st.bar_chart" not in stage_code
+    # Verify proper tables are used instead
+    assert "st.table" in stage_code
+    assert "Perturbation Norms & Geometric Bounds" in stage_code
+    assert "Actionable Security & Hardening Recommendations" in stage_code
+
+
+def test_dataset_sample_population_and_selection_options():
+    """Verify dataset total samples resolution and UI selection options (half, full, custom)."""
+    from frontend.services.ingestion_service import get_dataset_total_samples
+    from pathlib import Path
+
+    # Test preset & disk lookups
+    assert get_dataset_total_samples("adult_census", "tabular", "tabular-mlp-adult-census") == 250
+    assert get_dataset_total_samples("credit_fraud", "tabular", "tabular-mlp-credit-fraud") == 250
+    assert get_dataset_total_samples("bazyl/GTSRB", "image", "bazyl/gtsrb-model") == 12630
+    assert get_dataset_total_samples("time_series_ecg", "time-series", "time-series-ecg-classifier") == 200
+
+    # Verify frontend/streamlit_app.py contains half/full/custom selectors
+    app_code = Path("frontend/streamlit_app.py").read_text(encoding="utf-8")
+    assert "Half Dataset" in app_code
+    assert "Full Dataset" in app_code
+    assert "Custom Number of Samples" in app_code
+    assert "Dataset Population in Model/Benchmark" in app_code
+
+
+def test_report_generation_with_vulnerability_and_defense_results():
+    """Verify generate_security_report runs without UnboundLocalError when vulnerability_result and defense_result are provided."""
+    model_meta = {
+        "model_name": "TestVisionModel",
+        "domain": "image",
+        "framework": "pytorch",
+        "parameters": 1000,
+        "input_shape": [3, 32, 32],
+    }
+    attack_res = {
+        "attack_name": "FGSM",
+        "clean_accuracy": 100.0,
+        "adversarial_accuracy": 20.0,
+        "accuracy_drop": 80.0,
+        "asr_percentage": 80.0,
+        "perturbation_metrics": {
+            "linf": 0.05,
+            "linf_mean": 0.05,
+            "linf_max": 0.05,
+            "l2": 1.25,
+            "l2_mean": 1.25,
+            "l0": 3000,
+            "l0_mean_count": 3000,
+            "l0_mean_pct": 97.6,
+            "mean_abs_error": 0.04,
+            "mae_mean": 0.04,
+        },
+    }
+    vuln_res = {
+        "vulnerability_score": 75.5,
+        "risk_level": "HIGH",
+        "assessment": {
+            "attack_success_rate": 0.80,
+            "clean_accuracy": 1.0,
+            "adversarial_accuracy": 0.20,
+            "accuracy_drop": 0.80,
+            "perturbation": {
+                "linf_mean": 0.05,
+                "l2_mean": 1.25,
+                "l0_mean_count": 3000,
+                "mae_mean": 0.04,
+            },
+        },
+        "sub_scores": {
+            "attack_success_rate_score": 80.0,
+            "accuracy_drop_score": 80.0,
+            "stealth_score": 70.0,
+        },
+    }
+    defense_res = {
+        "selected_defense": "spatial_smoothing",
+        "status": "sufficient",
+        "is_improved": True,
+        "improvement_sufficient": True,
+        "clean_accuracy_before": 100.0,
+        "clean_accuracy_after": 98.0,
+        "clean_accuracy_drop": 2.0,
+        "asr_before": 80.0,
+        "asr_after": 25.0,
+        "asr_reduction": 55.0,
+        "vulnerability_score_before": 75.5,
+        "vulnerability_score_after": 32.0,
+        "vulnerability_score_improvement": 43.5,
+        "thresholds": {
+            "max_clean_accuracy_drop": 0.02,
+            "min_asr_reduction": 0.10,
+            "min_vuln_score_improvement": 5.0,
+        },
+    }
+
+    report = generate_security_report(
+        model_metadata=model_meta,
+        dataset_info={"dataset_name": "cifar10", "num_samples": 5},
+        attack_result=attack_res,
+        defense_result=defense_res,
+        vulnerability_result=vuln_res,
+        domain="image",
+    )
+    assert report is not None
+    assert report.report_id is not None
+    assert report.vulnerability_score == 75.5
+    assert report.risk_level == "HIGH"
+    assert "spatial_smoothing" in report.formatted_report
+    assert "RPT-" in report.report_id
+
+
+def test_defense_execution_batch_size_alignment():
+    """Verify execute_configured_defense safely aligns batch sizes when clean inputs/labels have 10 samples and adversarial has 5."""
+    model = SimpleVisionModel()
+    inputs_10 = torch.randn(10, 3, 32, 32)
+    labels_10 = torch.randint(0, 2, (10,))
+    adv_5 = inputs_10[:5] + 0.05
+    atk_res = {
+        "attack_name": "fgsm",
+        "clean_accuracy": 100.0,
+        "adversarial_accuracy": 0.0,
+        "asr_percentage": 100.0,
+        "original_predictions": labels_10[:5],
+        "adversarial_predictions": 1 - labels_10[:5],
+    }
+
+    res = execute_configured_defense(
+        model=model,
+        domain="image",
+        defense_choice="spatial_smoothing",
+        test_inputs=inputs_10,
+        test_labels=labels_10,
+        adversarial_examples=adv_5,
+        attack_result=atk_res,
+    )
+    assert res is not None
+    assert res["total_samples"] == 5
+    assert res["selected_defense"] == "spatial_smoothing"
+    assert "threshold_compliance" in res
+
+
+def test_execute_configured_defense_asr_zero_short_circuit():
+    """Verify that when baseline attack ASR is 0.0%, defense hardening is short-circuited."""
+    model = SimpleVisionModel()
+    inputs = torch.randn(4, 3, 16, 16)
+    labels = torch.tensor([0, 1, 0, 1])
+    adv_inputs = inputs + 0.01
+
+    atk_res = {
+        "attack_name": "fgsm",
+        "clean_accuracy": 100.0,
+        "adversarial_accuracy": 100.0,
+        "asr_percentage": 0.0,
+        "total_samples": 4,
+    }
+
+    res = execute_configured_defense(
+        model=model,
+        domain="image",
+        defense_choice="auto",
+        test_inputs=inputs,
+        test_labels=labels,
+        adversarial_examples=adv_inputs,
+        attack_result=atk_res,
+    )
+
+    assert res["success"] is True
+    assert res["status"] == "not_needed"
+    assert res["selected_defense"] == "None (Already Robust)"
+    assert res["before_asr"] == 0.0
+    assert res["after_asr"] == 0.0
+    assert res["clean_accuracy_drop"] == 0.0
+    assert "Model Already Robust" in res["defense_effectiveness"]
+
+
+def test_defense_results_no_unnecessary_charts_and_threshold_compliance():
+    """Verify that stage 6 (defense_results) has no st.bar_chart calls and includes threshold compliance."""
+    from pathlib import Path
+
+    app_code = Path("frontend/streamlit_app.py").read_text(encoding="utf-8")
+    stage_start = app_code.find('stage == "defense_results":')
+    stage_end = app_code.find('stage == "report":')
+    assert stage_start != -1 and stage_end != -1
+
+    stage_code = app_code[stage_start:stage_end]
+    # Verify no st.bar_chart calls remain in defense_results
+    assert "st.bar_chart" not in stage_code
+    # Verify modern table and threshold compliance are present
+    assert "Acceptance Thresholds & Robustness Compliance" in stage_code
+    assert "Compliance Verdict" in stage_code or "threshold_compliance" in stage_code
+
+
+def test_class_labels_mapping_and_targeted_attack_telemetry():
+    """Verify class semantic mappings and targeted attack metadata."""
+    from frontend.services.attack_service import (
+        get_class_labels_mapping,
+        execute_configured_attack,
+    )
+
+    # 1. Test class label mappings for known benchmarks
+    census_map = get_class_labels_mapping(dataset_name="adult_census")
+    assert 0 in census_map and 1 in census_map
+    assert "<=50K" in census_map[0]
+    assert ">50K" in census_map[1]
+
+    cifar_map = get_class_labels_mapping(dataset_name="uoft-cs/cifar10")
+    assert len(cifar_map) == 10
+    assert cifar_map[0] == "Airplane"
+    assert cifar_map[3] == "Cat"
+
+    # 2. Test targeted attack telemetry execution
+    model = SimpleVisionModel()
+    inputs = torch.randn(4, 3, 32, 32)
+    labels = torch.zeros(4, dtype=torch.long)  # All ground truth = 0
+
+    res = execute_configured_attack(
+        model=model,
+        attack_name="fgsm",
+        inputs=inputs,
+        labels=labels,
+        epsilon=0.05,
+        params={"targeted": True, "target_label": 1},
+        dataset_name="adult_census",
+    )
+    assert res is not None
+    assert res["is_targeted"] is True
+    assert res["target_label"] == 1
+    assert ">50K" in res["target_label_name"]
+    assert "targeted_hit_count" in res
+    assert "collateral_flip_count" in res
+    assert len(res["sample_comparisons"]) == 4
+
+
+def test_sample_table_pagination_and_filter_controls():
+    """Verify pagination and outcome filter controls exist in both attack_results and defense_results stages."""
+    from pathlib import Path
+
+    app_code = Path("frontend/streamlit_app.py").read_text(encoding="utf-8")
+
+    # In attack_results stage
+    assert "atk_sample_filter" in app_code
+    assert "atk_page_size" in app_code
+    assert "atk_prev_page" in app_code
+    assert "atk_next_page" in app_code
+
+    # In defense_results stage
+    assert "def_sample_filter" in app_code
+    assert "def_page_size" in app_code
+    assert "def_prev_page" in app_code
+    assert "def_next_page" in app_code
+
+
+def test_stage3_sample_selection_defaults_to_all():
+    """Verify Stage 3 evaluation sample selection defaults to all ingested samples and supports half/custom."""
+    from pathlib import Path
+
+    app_code = Path("frontend/streamlit_app.py").read_text(encoding="utf-8")
+
+    # Verify sample population selection structure
+    assert "Evaluation Sample Population (Batch Slicing)" in app_code
+    assert 'f"All Ingested ({available_samples:,} samples • 100%)"' in app_code
+    assert 'f"Half Ingested ({half_avail:,} samples • 50%)"' in app_code
+    assert '"Custom Number of Samples"' in app_code
+    # Must default to index=0 (All Ingested)
+    assert "index=0" in app_code
+
+
+def test_cw_dynamic_attack_parameters_has_no_alpha():
+    """Verify Carlini & Wagner (CW) configuration never uses an alpha step size and exposes correct L2 parameters."""
+    from pathlib import Path
+    from frontend.services.attack_service import execute_configured_attack
+
+    app_code = Path("frontend/streamlit_app.py").read_text(encoding="utf-8")
+
+    # Verify CW dynamic block does not assign alpha to params_dict
+    cw_block_start = app_code.find("if is_cw:")
+    cw_block_end = app_code.find("elif is_deepfool:", cw_block_start)
+    assert cw_block_start != -1 and cw_block_end != -1
+    cw_code = app_code[cw_block_start:cw_block_end]
+
+    assert 'params_dict["alpha"]' not in cw_code
+    assert "Step Size (α)" not in cw_code
+    assert "initial_const" in cw_code
+    assert "confidence" in cw_code
+    assert "learning_rate" in cw_code
+    assert "max_iterations" in cw_code
+
+    # Test backend execution with CW parameters
+    model = SimpleVisionModel()
+    inputs = torch.rand(2, 3, 16, 16)
+    labels = torch.tensor([0, 1])
+    res = execute_configured_attack(
+        model=model,
+        attack_name="cw",
+        inputs=inputs,
+        labels=labels,
+        epsilon=0.0,
+        clip_min=0.0,
+        clip_max=1.0,
+        params={
+            "max_iterations": 5,
+            "learning_rate": 0.01,
+            "initial_const": 1.0,
+            "confidence": 0.0,
+            "binary_search_steps": 1,
+        },
+    )
+    assert res is not None
+    assert "alpha" not in res["parameters_used"]
+    assert res["parameters_used"]["max_iterations"] == 5
+
+    # Test that passing c_penalty to image CW is accepted via alias mapping
+    res_c_pen = execute_configured_attack(
+        model=model,
+        attack_name="cw",
+        inputs=inputs,
+        labels=labels,
+        epsilon=0.0,
+        clip_min=0.0,
+        clip_max=1.0,
+        params={
+            "max_iterations": 5,
+            "learning_rate": 0.01,
+            "c_penalty": 1.5,
+            "confidence": 0.0,
+            "binary_search_steps": 1,
+        },
+    )
+    assert res_c_pen is not None
+    assert res_c_pen["parameters_used"]["c_penalty"] == 1.5
+    assert "asr_percentage" in res_c_pen
+
+
+def test_deepfool_and_jsma_dynamic_parameters():
+    """Verify DeepFool and JSMA configure algorithm-accurate parameters without alpha."""
+    from pathlib import Path
+    from frontend.services.attack_service import execute_configured_attack
+
+    app_code = Path("frontend/streamlit_app.py").read_text(encoding="utf-8")
+
+    # DeepFool
+    df_block_start = app_code.find("elif is_deepfool:")
+    df_block_end = app_code.find("elif is_jsma:", df_block_start)
+    assert df_block_start != -1 and df_block_end != -1
+    df_code = app_code[df_block_start:df_block_end]
+    assert 'params_dict["alpha"]' not in df_code
+    assert "overshoot" in df_code
+    assert "top_k" in df_code
+    assert "max_iter" in df_code
+
+    # JSMA
+    jsma_block_start = app_code.find("elif is_jsma:")
+    jsma_block_end = app_code.find("elif is_soft_dtw:", jsma_block_start)
+    assert jsma_block_start != -1 and jsma_block_end != -1
+    jsma_code = app_code[jsma_block_start:jsma_block_end]
+    assert 'params_dict["alpha"]' not in jsma_code
+    assert "max_features" in jsma_code
+    assert "step_size" in jsma_code
+
+    # FGSM
+    fgsm_block_start = app_code.find("elif is_fgsm:")
+    fgsm_block_end = app_code.find("elif is_fab:", fgsm_block_start)
+    assert fgsm_block_start != -1 and fgsm_block_end != -1
+    fgsm_code = app_code[fgsm_block_start:fgsm_block_end]
+    assert 'params_dict["alpha"]' not in fgsm_code
+    assert 'params_dict["num_steps"]' not in fgsm_code
+
+
+def test_batched_attack_execution_prevents_oom():
+    """Verify that execute_configured_attack processes batches exceeding single-chunk thresholds without failure."""
+    from frontend.services.attack_service import execute_configured_attack
+
+    model = SimpleVisionModel()
+    # 70 vision samples exceeds vision chunk size (32) to test multi-chunk execution & concatenation
+    inputs = torch.rand(70, 3, 16, 16)
+    labels = torch.randint(0, 2, (70,))
+
+    res = execute_configured_attack(
+        model=model,
+        attack_name="fgsm",
+        inputs=inputs,
+        labels=labels,
+        epsilon=0.05,
+    )
+
+    assert res is not None
+    assert len(res["sample_comparisons"]) == 70
+    assert res["_adversarial_examples"].size(0) == 70
+    assert "clean_accuracy" in res
+    assert "adversarial_accuracy" in res
+    assert "asr_percentage" in res
+
+
+def test_text_tokenizers_encoding_normalization_and_parameters():
+    """Verify that normalize_text_inputs supports tokenizers.Encoding-like objects and parameter registry accepts text parameters."""
+    from app.attack_engine.attacks.text._text_utils import prepare_text_inputs
+    from app.attack_engine.parameter_registry import prepare_attack_config
+    from app.attack_engine.config import AttackConfig
+
+    class MockEncoding:
+        def __init__(self, ids, mask):
+            self.ids = ids
+            self.attention_mask = mask
+
+    encodings = [
+        MockEncoding([101, 7592, 2088, 102], [1, 1, 1, 1]),
+        MockEncoding([101, 3231, 2048, 102], [1, 1, 1, 1]),
+    ]
+
+    input_ids, attention_mask, input_type, texts = prepare_text_inputs(encodings)
+    assert input_ids.shape == (2, 4)
+    assert attention_mask.shape == (2, 4)
+    assert input_type == "tensor"
+
+    # Test hotflip parameter validation
+    cfg_hotflip = prepare_attack_config(
+        domain="text",
+        attack_name="hotflip",
+        config=AttackConfig(params={"max_modifications": 3, "candidate_vocab_size": 25}),
+    )
+    assert cfg_hotflip.params["max_modifications"] == 3
+    assert cfg_hotflip.params["candidate_vocab_size"] == 25
+
+    # Test textbugger_wb parameter validation
+    cfg_bugger = prepare_attack_config(
+        domain="text",
+        attack_name="textbugger_wb",
+        config=AttackConfig(params={"max_modifications": 4, "bug_types": ["sub_w"]}),
+    )
+    assert cfg_bugger.params["max_modifications"] == 4
+
+    # Test gradient_substitution parameter validation
+    cfg_grad = prepare_attack_config(
+        domain="text",
+        attack_name="gradient_substitution",
+        config=AttackConfig(params={"max_modifications": 2, "num_candidates": 8, "similarity_threshold": 0.5}),
+    )
+    assert cfg_grad.params["max_modifications"] == 2
+    assert cfg_grad.params["num_candidates"] == 8
+
+    # Also test that if num_steps is passed to text token attacks, it is mapped to max_modifications
+    cfg_step_map = prepare_attack_config(
+        domain="text",
+        attack_name="hotflip",
+        config=AttackConfig(params={"num_steps": 5}),
+    )
+    assert cfg_step_map.params["max_modifications"] == 5
+
+
+def test_vulnerability_assessment_handles_empty_predictions_safely():
+    """Verify that assess_and_score_vulnerability does not crash with zero-size array reduction errors."""
+    from frontend.services.vulnerability_service import assess_and_score_vulnerability
+
+    class SimpleMockModel:
+        def __init__(self):
+            self.model_name = "MockModel"
+
+    model = SimpleMockModel()
+    attack_result = {
+        "attack_name": "embedding_pgd",
+        "attack_class": "EmbeddingPGD",
+        "clean_accuracy": 100.0,
+        "adversarial_accuracy": 0.0,
+        "clean_confidence": 95.0,
+        "adversarial_confidence": 40.0,
+        "original_predictions": None,  # Simulates missing predictions
+        "adversarial_predictions": None,
+        "epsilon_used": 0.5,
+    }
+    inputs = {"input_ids": torch.tensor([[101, 102], [101, 103]]), "attention_mask": torch.tensor([[1, 1], [1, 1]])}
+    labels = torch.tensor([0, 1])
+
+    res = assess_and_score_vulnerability(
+        model=model,
+        attack_result=attack_result,
+        inputs=inputs,
+        labels=labels,
+        domain="text",
+    )
+    assert res is not None
+    assert "vulnerability_score" in res
+    assert "risk_level" in res
+
+
+def test_vae_attack_auto_equips_fallback_vae():
+    """Verify that execute_configured_attack automatically attaches SimpleTabularVAE when running VAEAttack."""
+    from frontend.services.attack_service import execute_configured_attack
+
+    class DummyTabularModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(14, 2)
+
+        def forward(self, x):
+            return self.fc(x)
+
+    model = DummyTabularModel()
+    inputs = torch.randn(5, 14)
+    labels = torch.tensor([0, 1, 0, 1, 0])
+
+    res = execute_configured_attack(
+        model=model,
+        attack_name="vae_attack",
+        inputs=inputs,
+        labels=labels,
+        epsilon=0.5,
+    )
+    assert res is not None
+    assert res["attack_name"] == "VAE_ATTACK"
+    assert "asr_percentage" in res
+
+
+def test_xai_session_state_and_navigation():
+    """Verify session state management for XAI analysis stage and explanation caching."""
+    from frontend.utils.session_state import (
+        get_workflow_stage,
+        set_workflow_stage,
+        get_xai_result,
+        set_xai_result,
+        get_defense_xai_result,
+        set_defense_xai_result,
+    )
+    set_workflow_stage("xai_analysis")
+    assert get_workflow_stage() == "xai_analysis"
+
+    mock_xai = {"technique": "saliency", "executed": True, "clean_prediction": 1, "adversarial_prediction": 0}
+    set_xai_result(mock_xai)
+    assert get_xai_result() == mock_xai
+
+    mock_def_xai = {"technique": "saliency", "executed": True, "clean_prediction": 1, "adversarial_prediction": 1}
+    set_defense_xai_result(mock_def_xai)
+    assert get_defense_xai_result() == mock_def_xai
+
+
+def test_get_available_xai_techniques_modalities():
+    """Verify detection of available XAI techniques and suggested techniques across diverse modalities."""
+    from frontend.services.xai_service import get_available_xai_techniques, get_suggested_xai_technique
+
+    for mod in ["image", "text", "tabular", "timeseries", "audio"]:
+        techs = get_available_xai_techniques(domain=mod)
+        assert isinstance(techs, list)
+        assert len(techs) > 0
+
+        suggested = get_suggested_xai_technique(domain=mod)
+        assert isinstance(suggested, str)
+        assert suggested in techs
+
+
+def test_session_state_active_assessment_populates_model():
+    """Verify that set_active_assessment and get_active_assessment ensure model is populated."""
+    from frontend.utils.session_state import set_active_assessment, get_active_assessment
+
+    dummy_adapter = object()
+    set_active_assessment({"adapter": dummy_adapter, "domain": "tabular"})
+    active = get_active_assessment()
+    assert active is not None
+    assert active.get("model") is dummy_adapter
+
+
+def test_xai_visualizer_modality_independent():
+    """Verify modality-independent visualizer functions render without exceptions."""
+    import numpy as np
+    from frontend.components.xai_visualizer import (
+        render_dynamic_xai_dashboard,
+        render_pre_post_defense_comparison,
+        render_feature_importance_bars,
+        render_spatial_heatmaps,
+        render_token_attribution_view,
+        render_temporal_attribution_curve,
+    )
+
+    # 1. Tabular mock
+    tabular_xai = {
+        "status": "success",
+        "executed": True,
+        "technique": "shap",
+        "clean_prediction": 1,
+        "adversarial_prediction": 0,
+        "clean_confidence": 0.92,
+        "adversarial_confidence": 0.88,
+        "prediction_changed": True,
+        "local_explanation": {
+            "clean_top_features": [{"feature": "age", "weight": 0.45}, {"feature": "income", "weight": -0.32}],
+            "adversarial_top_features": [{"feature": "age", "weight": -0.10}, {"feature": "income", "weight": 0.65}],
+            "attribution_drift": 0.55,
+        },
+    }
+    render_dynamic_xai_dashboard(tabular_xai)
+    assert render_feature_importance_bars(tabular_xai) is True
+
+    # 2. Image / Spatial mock (2D attribution)
+    spatial_xai = {
+        "status": "success",
+        "executed": True,
+        "technique": "saliency",
+        "clean_prediction": 3,
+        "adversarial_prediction": 7,
+        "clean_confidence": 0.98,
+        "adversarial_confidence": 0.91,
+        "prediction_changed": True,
+        "clean_attribution": np.random.rand(28, 28),
+        "adversarial_attribution": np.random.rand(28, 28),
+    }
+    render_dynamic_xai_dashboard(spatial_xai)
+    assert render_spatial_heatmaps(spatial_xai) is True
+
+    # 3. Text mock (tokens)
+    text_xai = {
+        "status": "success",
+        "executed": True,
+        "technique": "integrated_gradients",
+        "clean_prediction": 1,
+        "adversarial_prediction": 0,
+        "prediction_changed": True,
+        "local_explanation": {
+            "tokens": ["The", "movie", "was", "terrible", "!", "bad"],
+            "attributions": [0.05, 0.1, 0.0, -0.8, -0.2, -0.9],
+        },
+    }
+    render_dynamic_xai_dashboard(text_xai)
+    assert render_token_attribution_view(text_xai) is True
+
+    # 4. Time-series mock (1D temporal sequence)
+    ts_xai = {
+        "status": "success",
+        "executed": True,
+        "technique": "saliency",
+        "clean_prediction": 0,
+        "adversarial_prediction": 1,
+        "prediction_changed": True,
+        "clean_attribution": np.random.rand(50),
+        "adversarial_attribution": np.random.rand(50),
+    }
+    render_dynamic_xai_dashboard(ts_xai)
+    assert render_temporal_attribution_curve(ts_xai) is True
+
+    # 5. Pre vs Post defense comparison
+    post_def_xai = dict(tabular_xai)
+    post_def_xai["adversarial_prediction"] = 1  # Restored!
+    post_def_xai["prediction_changed"] = False
+    render_pre_post_defense_comparison(tabular_xai, post_def_xai)
+
+
+def test_report_generation_with_and_without_xai():
+    """Verify Section 9 population in security report generation when XAI is executed vs skipped."""
+    from frontend.services.report_service import generate_security_report
+
+    model_meta = {"Model Name": "TestNet", "Architecture": "CNN", "Framework": "PyTorch"}
+    dataset_info = {"dataset_name": "TestBatch", "total_samples": 10}
+    attack_res = {
+        "attack_name": "PGD",
+        "asr_percentage": 75.0,
+        "clean_accuracy": 100.0,
+        "adversarial_accuracy": 25.0,
+        "clean_confidence": 95.0,
+        "adversarial_confidence": 60.0,
+        "accuracy_drop": 75.0,
+        "confidence_drop": 35.0,
+        "total_samples": 10,
+    }
+
+    # Case A: Report without XAI (skipped)
+    rep_no_xai = generate_security_report(
+        model_metadata=model_meta,
+        dataset_info=dataset_info,
+        attack_result=attack_res,
+        xai_result=None,
+    )
+    assert rep_no_xai is not None
+    rep_no_xai_dict = rep_no_xai.to_dict()
+    assert "xai_findings" in rep_no_xai_dict
+    assert rep_no_xai_dict["xai_findings"] == {}
+
+    # Case B: Report with XAI result
+    xai_findings = {
+        "technique": "integrated_gradients",
+        "status": "success",
+        "clean_prediction": 1,
+        "adversarial_prediction": 0,
+        "local_explanation": {
+            "clean_top_features": [{"feature": "f1", "weight": 0.8}],
+            "adversarial_top_features": [{"feature": "f2", "weight": -0.9}],
+            "attribution_drift": 0.65,
+        },
+    }
+    rep_with_xai = generate_security_report(
+        model_metadata=model_meta,
+        dataset_info=dataset_info,
+        attack_result=attack_res,
+        xai_result=xai_findings,
+    )
+    assert rep_with_xai is not None
+    rep_with_xai_dict = rep_with_xai.to_dict()
+    assert rep_with_xai_dict["xai_findings"]["technique"] == "integrated_gradients"
+    assert rep_with_xai_dict["xai_findings"]["local_explanation"]["attribution_drift"] == 0.65
+
+
+def test_xai_explain_assessment_accepts_dict_attack_result():
+    """Verify that explain_assessment handles dictionary attack results without AttributeError."""
+    import torch.nn as nn
+    from frontend.services.xai_service import explain_assessment
+
+    class DummyLinearModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(4, 2)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    model = DummyLinearModel()
+    inputs = torch.randn(2, 4)
+    adv_inputs = inputs + 0.05 * torch.randn_like(inputs)
+    labels = torch.tensor([0, 1])
+
+    # Frontend dictionary attack result (simulating get_attack_result())
+    dict_attack_result = {
+        "attack_name": "PGD",
+        "original_inputs": inputs,
+        "adversarial_examples": adv_inputs,
+        "labels": labels,
+        "total_samples": 2,
+    }
+
+    res = explain_assessment(
+        model=model,
+        attack_result=dict_attack_result,
+        domain="tabular",
+        technique="saliency",
+    )
+    assert res is not None
+    # Should not crash with "'dict' object has no attribute 'original_inputs'"
+    assert res.get("status") in ("success", "valid", "unsupported", "unavailable")
+
+
+def test_timeseries_sequence_length_alignment_on_attack():
+    """Verify that execute_configured_attack aligns mismatched sequence lengths to model config."""
+    import torch.nn as nn
+    from frontend.services.attack_service import execute_configured_attack
+
+    class DummyTSModel(nn.Module):
+        def __init__(self, seq_len=32, channels=1):
+            super().__init__()
+            self.expected_seq_len = seq_len
+            self.fc = nn.Linear(seq_len * channels, 2)
+            # Simulate a config object with sequence_length
+            class DummyConfig:
+                sequence_length = seq_len
+                num_input_channels = channels
+            self.config = DummyConfig()
+
+        def forward(self, x):
+            if x.shape[1] != self.expected_seq_len:
+                raise ValueError(
+                    f"Input sequence length ({x.shape[1]}) doesn't match model configuration ({self.expected_seq_len})."
+                )
+            return self.fc(x.view(x.size(0), -1))
+
+    model = DummyTSModel(seq_len=32, channels=1)
+    # Inputs have sequence length 14 (mismatched)
+    mismatched_inputs = torch.randn(4, 14, 1)
+    labels = torch.tensor([0, 1, 0, 1])
+
+    res = execute_configured_attack(
+        model=model,
+        attack_name="pgd",
+        inputs=mismatched_inputs,
+        labels=labels,
+        epsilon=0.1,
+    )
+    assert res is not None
+    assert "asr_percentage" in res
+    assert res["attack_name"] == "PGD"
+    assert "_attack_result_obj" in res
+    assert "original_inputs" in res
+
+
+def test_timeseries_negative_inputs_clip_bounds_and_predictions():
+    """Verify that standardized time-series inputs with negative values retain valid bounds and extract predictions."""
+    import torch.nn as nn
+    from frontend.services.attack_service import execute_configured_attack
+
+    class DummyTSLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(50, 2)
+
+        def forward(self, x):
+            # Expects (B, 1, 50) or (B, 50, 1)
+            flat = x.reshape(x.size(0), -1)
+            return self.fc(flat)
+
+    model = DummyTSLinear()
+    # Negative standardized values
+    inputs = torch.randn(8, 1, 50)
+    labels = torch.randint(0, 2, (8,))
+
+    res = execute_configured_attack(
+        model=model,
+        attack_name="pgd",
+        inputs=inputs,
+        labels=labels,
+        epsilon=0.5,
+        clip_min=0.0,
+        clip_max=1.0,
+    )
+    assert res is not None
+    assert "asr_percentage" in res
+    assert res["clean_accuracy"] is not None
+    assert res["adversarial_accuracy"] is not None
+    assert res["_clean_inputs"] is not None
+
+
+def test_timeseries_soft_dtw_channels_first_layout():
+    """Verify SoftDTWAttack operates on (B, 1, T) layout without early aborting."""
+    import torch.nn as nn
+    from app.attack_engine.attacks.time_series.soft_dtw import SoftDTWAttack
+    from app.attack_engine.config import AttackConfig
+
+    class Dummy1DNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv1d(1, 4, kernel_size=3, padding=1)
+            self.fc = nn.Linear(4 * 20, 2)
+
+        def forward(self, x):
+            # Expects (B, 1, 20)
+            h = self.conv(x)
+            return self.fc(h.view(x.size(0), -1))
+
+    model = Dummy1DNet()
+    inputs = torch.randn(4, 1, 20)
+    labels = torch.tensor([0, 1, 0, 1])
+
+    attack = SoftDTWAttack(model=model)
+    cfg = AttackConfig(epsilon=0.2, params={"num_steps": 3, "max_warp": 0.2})
+    adv = attack.generate(inputs, labels=labels, config=cfg)
+    assert adv.shape == inputs.shape
+    assert isinstance(adv, torch.Tensor)
+
+
+def test_xai_model_output_prediction_outputs_unwrapping():
+    """Verify XAI explainer extracts logits and avoids over-unwrapping models with .model attribute."""
+    import torch.nn as nn
+    from frontend.services.xai_service import explain_assessment
+
+    class DummyBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(10, 10)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    class DummyContainer:
+        def __init__(self, logits, hidden):
+            self.prediction_outputs = logits
+            self.last_hidden_state = hidden
+
+    class DummyModelWithModelAttr(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = DummyBackbone()
+            self.head = nn.Linear(10, 2)
+
+        def forward(self, x):
+            flat = x.view(x.size(0), -1)
+            h = self.model(flat)
+            logits = self.head(h)
+            return DummyContainer(logits=logits, hidden=h)
+
+    model = DummyModelWithModelAttr()
+    inputs = torch.randn(4, 10)
+    labels = torch.tensor([0, 1, 0, 1])
+
+    attack_result = {
+        "attack_name": "PGD",
+        "original_inputs": inputs,
+        "clean_inputs": inputs,
+        "adversarial_examples": inputs + 0.05,
+        "labels": labels,
+        "original_predictions": labels,
+        "adversarial_predictions": labels,
+        "threat_model": "white_box",
+    }
+
+    xai_res = explain_assessment(
+        model=model,
+        attack_result=attack_result,
+        domain="tabular",
+        technique="saliency",
+    )
+    assert xai_res is not None
+    assert xai_res.get("executed") is True
+    assert xai_res.get("status") == "success"
+
+
+def test_xai_frontend_single_sample_isolation():
+    """Verify sample_index isolates target sample and generates valid ExplanationResult."""
+    class SimpleCNN(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(3, 4, kernel_size=3, padding=1)
+            self.pool = nn.AdaptiveAvgPool2d((1, 1))
+            self.fc = nn.Linear(4, 2)
+
+        def forward(self, x):
+            h = torch.relu(self.conv(x))
+            h = self.pool(h).flatten(1)
+            return self.fc(h)
+
+    model = SimpleCNN()
+    clean = torch.randn(3, 3, 16, 16)
+    adv = clean + 0.05 * torch.randn_like(clean)
+    atk = {
+        "attack_name": "fgsm",
+        "original_inputs": clean,
+        "adversarial_examples": adv,
+        "labels": torch.tensor([0, 1, 0]),
+        "original_predictions": [0, 1, 0],
+        "adversarial_predictions": [1, 1, 0],
+    }
+
+    res_single = explain_assessment(
+        model=model,
+        attack_result=atk,
+        domain="image",
+        technique="saliency",
+        mode="fast",
+        sample_index=1,
+    )
+
+    assert res_single["executed"] is True
+    assert res_single["status"] == "success"
+    assert res_single["clean_prediction"] is not None
+    assert res_single["adversarial_prediction"] is not None
+    assert res_single["clean_attribution"] is not None
+    assert res_single["adversarial_attribution"] is not None
+    assert res_single["target_class"] is not None
+
+    from frontend.components.xai_visualizer import render_spatial_heatmaps
+    assert render_spatial_heatmaps(res_single) is True
+
+
+def test_xai_frontend_batch_and_temporal_visualization():
+    """Verify batch and temporal time-series results comply with visualization rendering contracts."""
+    class TSModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gru = nn.GRU(input_size=4, hidden_size=8, batch_first=True)
+            self.fc = nn.Linear(8, 2)
+
+        def forward(self, x):
+            out, _ = self.gru(x)
+            return self.fc(out[:, -1, :])
+
+    model = TSModel()
+    clean = torch.randn(2, 8, 4)
+    adv = clean + 0.05 * torch.randn_like(clean)
+    atk = {
+        "attack_name": "fgsm",
+        "original_inputs": clean,
+        "adversarial_examples": adv,
+        "labels": torch.tensor([0, 1]),
+    }
+
+    res_ts = explain_assessment(
+        model=model,
+        attack_result=atk,
+        domain="timeseries",
+        technique="integrated_gradients",
+        mode="fast",
+    )
+
+    assert res_ts["executed"] is True
+    assert res_ts["clean_prediction"] is not None
+    assert res_ts["clean_confidence"] is not None
+
+    from frontend.components.xai_visualizer import render_temporal_attribution_curve
+    assert render_temporal_attribution_curve(res_ts) is True
+
+
+def test_xai_frontend_report_section_9_integration():
+    """Verify M6 XAI findings seamlessly pass to M9 ReportData and render Section 9 cleanly."""
+    from app.report_generator.report_generator import ReportGenerator
+    from app.report_generator.report_data import ReportData
+
+    sample_xai = {
+        "status": "success",
+        "executed": True,
+        "technique": "saliency",
+        "clean_prediction": 0,
+        "adversarial_prediction": 1,
+        "clean_confidence": 0.95,
+        "adversarial_confidence": 0.88,
+        "prediction_changed": True,
+        "local_explanation": {
+            "clean_top_features": [{"feature": "feat_0", "weight": 0.42}],
+            "adversarial_top_features": [{"feature": "feat_1", "weight": 0.77}],
+        },
+    }
+
+    rep_data = ReportData(
+        model_info={"model_name": "eval_model", "framework": "pytorch"},
+        dataset_config={"dataset_name": "eval_dataset", "domain": "image", "total_samples": 2},
+        baseline_performance={"accuracy": 0.95},
+        attack_results={"fgsm": {"success": True, "evaluation": {"metrics": {"asr": 0.8}}}},
+        vulnerability_metrics={},
+        vulnerability_score=80.0,
+        risk_level="HIGH",
+        xai_findings=sample_xai,
+    )
+
+    gen = ReportGenerator()
+    res = gen.generate(rep_data)
+    report_text = res.formatted_report
+
+    assert "9. XAI FINDINGS" in report_text
+    assert "▶ Technique: saliency" in report_text
+    assert "▶ Technique: status" not in report_text
+    assert "▶ Technique: executed" not in report_text
+
+
+def test_xai_metrics_summary_na_handling():
+    """Verify that render_xai_metrics_summary displays N/A for missing predictions, indeterminate consistency, and missing drift."""
+    from frontend.components.xai_visualizer import render_xai_metrics_summary
+
+    # Case 1: Missing predictions -> Indeterminate consistency, N/A drift
+    xai_missing = {
+        "technique": "shap",
+        "clean_prediction": None,
+        "adversarial_prediction": None,
+        "prediction_changed": None,
+        "attribution_drift": None,
+        "feature_salience_distortion": None,
+    }
+    # Should not raise exception
+    render_xai_metrics_summary(xai_missing)
+
+    # Case 2: Numerical drift and distortion present
+    xai_valid = {
+        "technique": "shap",
+        "clean_prediction": 1,
+        "adversarial_prediction": 0,
+        "prediction_changed": True,
+        "clean_confidence": 0.92,
+        "adversarial_confidence": 0.78,
+        "attribution_drift": 0.3541,
+        "feature_salience_distortion": 0.2819,
+    }
+    render_xai_metrics_summary(xai_valid)
+
+
+def test_xai_drift_and_distortion_math():
+    """Verify mathematical definitions of attribution drift and salience distortion in comparison module."""
+    import numpy as np
+    from app.explainability.comparison import compare_attributions, compare_explanations
+
+    # Unit vectors with known cosine similarity:
+    # A_clean = [1, 0], A_adv = [0.6, 0.8] -> cosine_sim = 0.6
+    # Salience distortion = 1 - 0.6 = 0.4
+    # Clean L1 norm = 1.0, Adv L1 norm = 1.4 -> normed A_clean = [1, 0], normed A_adv = [0.6/1.4, 0.8/1.4] = [3/7, 4/7]
+    # L1 drift = |1 - 3/7| + |0 - 4/7| = 4/7 + 4/7 = 8/7 ~ 1.142857
+    clean_vec = np.array([1.0, 0.0])
+    adv_vec = np.array([0.6, 0.8])
+
+    comp = compare_attributions(clean_vec, adv_vec)
+    assert comp["attribution_comparison_status"] == "success"
+    assert abs(comp["feature_salience_distortion"] - 0.4) < 1e-5
+    assert abs(comp["attribution_drift"] - (8.0 / 7.0)) < 1e-5
+
+    # Prediction consistency must be None when either prediction is None
+    exp_comp_none = compare_explanations(
+        clean_prediction=None,
+        adversarial_prediction=1,
+        clean_attribution=clean_vec,
+        adv_attribution=adv_vec,
+    )
+    assert exp_comp_none["prediction_changed"] is None
+    assert exp_comp_none["prediction_analysis"]["prediction_consistency"] is None
+    assert abs(exp_comp_none["feature_salience_distortion"] - 0.4) < 1e-5
+    assert abs(exp_comp_none["attribution_drift"] - (8.0 / 7.0)) < 1e-5
+
+
+def test_global_shap_importance_vs_vulnerability_frequency():
+    """Verify separation of global mean absolute SHAP importance from adversarial vulnerability frequency."""
+    from app.explainability.aggregate import aggregate_explanations
+    from app.explainability.explanation_result import ExplanationResult
+
+    # Sample 1: feature_A = 2.0, feature_B = -1.0
+    r1 = ExplanationResult(
+        attack_name="fgsm",
+        technique="shap",
+        clean_prediction=0,
+        adversarial_prediction=1,
+        clean_confidence=0.9,
+        adversarial_confidence=0.8,
+        prediction_changed=True,
+        attack_caused_failure=True,
+        attribution={
+            "clean": {
+                "feature_importance_map": {"feature_A": 2.0, "feature_B": -1.0},
+            }
+        },
+        feature_importance={
+            "clean_top_features": [
+                {"feature": "feature_A", "importance": 2.0},
+                {"feature": "feature_B", "importance": -1.0},
+            ]
+        },
+        failure_analysis={
+            "clean_correct": True,
+            "contributing_features": [{"feature": "feature_B", "importance_shift": 1.5}],
+        },
+    )
+
+    # Sample 2: feature_A = 0.0, feature_B = 3.0, feature_C = 4.0
+    r2 = ExplanationResult(
+        attack_name="pgd",
+        technique="shap",
+        clean_prediction=0,
+        adversarial_prediction=0,
+        clean_confidence=0.85,
+        adversarial_confidence=0.80,
+        prediction_changed=False,
+        attack_caused_failure=False,
+        attribution={
+            "clean": {
+                "feature_importance_map": {"feature_A": 0.0, "feature_B": 3.0, "feature_C": 4.0},
+            }
+        },
+        feature_importance={
+            "clean_top_features": [
+                {"feature": "feature_B", "importance": 3.0},
+                {"feature": "feature_C", "importance": 4.0},
+            ]
+        },
+        failure_analysis={
+            "clean_correct": True,
+            "contributing_features": [],
+        },
+    )
+
+    agg = aggregate_explanations([r1, r2])
+
+    assert "global_feature_importance" in agg
+    assert "vulnerability_frequency" in agg
+    assert "global_top_features" in agg
+
+    # Global SHAP feature importance: mean absolute attribution across all N=2 samples
+    # feature_B: (| -1.0 | + | 3.0 |) / 2 = 2.0
+    # feature_C: (0.0 + | 4.0 |) / 2 = 2.0
+    # feature_A: (| 2.0 | + 0.0) / 2 = 1.0
+    g_map = {item["feature"]: item["mean_abs_importance"] for item in agg["global_feature_importance"]}
+    assert abs(g_map["feature_B"] - 2.0) < 1e-5
+    assert abs(g_map["feature_C"] - 2.0) < 1e-5
+    assert abs(g_map["feature_A"] - 1.0) < 1e-5
+
+    # Vulnerability frequency: feature_B contributed to successful attack failure in sample 1,
+    # and was present in sample 2 (unsuccessful attack); feature_C was only present in sample 2.
+    v_succ_map = {item["feature"]: item["success_frequency"] for item in agg["vulnerability_frequency"]}
+    v_tot_map = {item["feature"]: item["frequency"] for item in agg["vulnerability_frequency"]}
+    assert v_succ_map.get("feature_B") == 1
+    assert v_tot_map.get("feature_B") == 2
+    assert v_succ_map.get("feature_C") == 0
+    assert "feature_A" not in v_tot_map
+
+
+def test_xai_feature_names_metadata_propagation():
+    """Verify feature names from metadata are propagated and returned in XAI results."""
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    from frontend.services.xai_service import explain_assessment
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(4, 2)
+            self.feature_names_in_ = np.array(["income", "credit_score", "debt_ratio", "age"])
+
+        def forward(self, x):
+            if isinstance(x, np.ndarray):
+                x = torch.from_numpy(x).float()
+            return self.linear(x.float())
+
+    attack_res = {
+        "technique": "pgd",
+        "original_inputs": torch.tensor([[1000.0, 750.0, 0.25, 35.0]], dtype=torch.float32),
+        "adversarial_examples": torch.tensor([[1000.0, 600.0, 0.25, 35.0]], dtype=torch.float32),
+        "labels": torch.tensor([0]),
+        "original_predictions": [0],
+        "adversarial_predictions": [1],
+        "metadata": {
+            "feature_names": ["income", "credit_score", "debt_ratio", "age"],
+        },
+    }
+
+    res = explain_assessment(
+        model=DummyModel(),
+        attack_result=attack_res,
+        technique="saliency",
+        domain="tabular",
+    )
+    assert res["status"] == "success"
+    assert res["feature_names"] == ["income", "credit_score", "debt_ratio", "age"]
+    assert res["clean_prediction"] is not None
+    assert res["adversarial_prediction"] is not None
+    assert res["attribution_drift"] is not None
+
+
+def test_mathematical_edge_cases_zero_norm_and_bounds():
+    """Verify attribution comparison behavior under zero-norm vectors and verify drift remains in [0, 2]."""
+    import numpy as np
+    from app.explainability.comparison import compare_attributions
+
+    # Case A: Both zero-norm vectors
+    zero_vec = np.zeros(5)
+    res_both_zero = compare_attributions(zero_vec, zero_vec)
+    assert res_both_zero["attribution_comparison_status"] == "success"
+    assert res_both_zero["attribution_validity"]["status"] == "near_zero"
+    assert res_both_zero["attribution_drift"] == 0.0
+    assert res_both_zero["attribution_cosine_similarity"] == 1.0
+    assert res_both_zero["feature_salience_distortion"] == 0.0
+
+    # Case B: Clean zero-norm, Adv non-zero
+    non_zero_vec = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    res_one_zero = compare_attributions(zero_vec, non_zero_vec)
+    assert res_one_zero["attribution_drift"] == 1.0
+    assert res_one_zero["attribution_cosine_similarity"] == 0.0
+    assert res_one_zero["feature_salience_distortion"] == 1.0
+
+    # Case C: Clean non-zero, Adv zero-norm
+    res_adv_zero = compare_attributions(non_zero_vec, zero_vec)
+    assert res_adv_zero["attribution_drift"] == 1.0
+    assert res_adv_zero["attribution_cosine_similarity"] == 0.0
+    assert res_adv_zero["feature_salience_distortion"] == 1.0
+
+    # Case D: Identical vectors -> Drift = 0.0, Distortion = 0.0
+    res_identical = compare_attributions(non_zero_vec, non_zero_vec)
+    assert abs(res_identical["attribution_drift"] - 0.0) < 1e-6
+    assert abs(res_identical["feature_salience_distortion"] - 0.0) < 1e-6
+
+    # Case E: Completely opposite vectors -> Drift = 2.0, Distortion = 2.0
+    opposite_vec = -non_zero_vec
+    res_opposite = compare_attributions(non_zero_vec, opposite_vec)
+    assert 0.0 <= res_opposite["attribution_drift"] <= 2.0
+    assert abs(res_opposite["attribution_drift"] - 2.0) < 1e-6
+    assert abs(res_opposite["feature_salience_distortion"] - 2.0) < 1e-6
+
+
+def test_mathematical_edge_cases_nan_inf_and_mismatch():
+    """Verify NaN, Inf, and dimension mismatch handling."""
+    import numpy as np
+    from app.explainability.comparison import compare_attributions
+
+    # Case A: NaN values
+    nan_vec = np.array([1.0, np.nan, 3.0])
+    valid_vec = np.array([1.0, 2.0, 3.0])
+    res_nan = compare_attributions(nan_vec, valid_vec)
+    assert res_nan["attribution_comparison_status"] == "non_finite_attributions"
+    assert res_nan["attribution_drift"] is None
+    assert res_nan["feature_salience_distortion"] is None
+
+    # Case B: Inf values
+    inf_vec = np.array([1.0, np.inf, 3.0])
+    res_inf = compare_attributions(valid_vec, inf_vec)
+    assert res_inf["attribution_comparison_status"] == "non_finite_attributions"
+    assert res_inf["attribution_drift"] is None
+
+    # Case C: 1D dimension mismatch -> padded and aligned
+    v1 = np.array([1.0, 2.0])
+    v2 = np.array([1.0, 2.0, 3.0, 4.0])
+    res_pad = compare_attributions(v1, v2)
+    assert res_pad["attribution_comparison_status"] == "aligned_with_padding"
+    assert 0.0 <= res_pad["attribution_drift"] <= 2.0
+
+    # Case D: 2D dimension mismatch -> shape_mismatch status, metrics None
+    m1 = np.zeros((2, 3))
+    m2 = np.zeros((4, 5))
+    res_shape = compare_attributions(m1, m2)
+    assert res_shape["attribution_comparison_status"] == "shape_mismatch"
+    assert res_shape["attribution_drift"] is None
+
+
+def test_global_aggregation_denominator_excludes_failed_explanations():
+    """Verify that failed/invalid explanations are excluded from global feature importance denominators."""
+    from app.explainability.aggregate import aggregate_explanations
+    from app.explainability.explanation_result import ExplanationResult
+
+    # Sample 1: Valid explanation with feature_A = 4.0
+    r1 = ExplanationResult(
+        attack_name="fgsm",
+        technique="shap",
+        clean_prediction=0,
+        adversarial_prediction=1,
+        clean_confidence=0.9,
+        adversarial_confidence=0.8,
+        prediction_changed=True,
+        attribution_status="success",
+        attribution={
+            "clean": {
+                "feature_importance_map": {"feature_A": 4.0},
+            }
+        },
+        feature_importance={
+            "clean_top_features": [{"feature": "feature_A", "importance": 4.0}]
+        },
+    )
+
+    # Sample 2: Failed explanation (e.g. attribution error)
+    r2 = ExplanationResult(
+        attack_name="fgsm",
+        technique="shap",
+        clean_prediction=0,
+        adversarial_prediction=0,
+        clean_confidence=0.8,
+        adversarial_confidence=0.8,
+        prediction_changed=False,
+        attribution_status="error",
+        attribution={},
+    )
+
+    agg = aggregate_explanations([r1, r2])
+    assert agg["total_samples"] == 2
+    assert agg["valid_samples_count"] == 1
+    assert agg["explanation_failure_count"] == 1
+    assert agg["explanation_failure_rate"] == 0.5
+
+    # Mean absolute importance of feature_A should be 4.0 / 1 (valid sample), NOT diluted to 4.0 / 2
+    g_imp = {item["feature"]: item["mean_abs_importance"] for item in agg["global_feature_importance"]}
+    assert abs(g_imp["feature_A"] - 4.0) < 1e-5
+
+
+def test_multiclass_shap_extraction_and_sample_index_matching():
+    """Verify multi-class 3D SHAP extraction and sample index slicing integrity."""
+    import numpy as np
+    from app.explainability.techniques.shap_explainer import SHAPExplainer
+
+    explainer = SHAPExplainer()
+
+    # 3D SHAP values: (batch_size=1, num_features=4, num_classes=3)
+    shap_vals = np.zeros((1, 4, 3))
+    # Target class 2 has distinct attributions: [0.1, 0.2, 0.3, 0.4]
+    shap_vals[0, :, 2] = np.array([0.1, 0.2, 0.3, 0.4])
+
+    extracted = explainer._extract_target_attribution(shap_vals, target_class=2, batch_size=1)
+    assert extracted.shape == (1, 4)
+    assert np.allclose(extracted[0], [0.1, 0.2, 0.3, 0.4])
+
+
+def test_xai_status_message_consistency_on_error():
+    """Verify that when explainer reports attribution_status='error', xai_service returns
+    status='error', executed=False, and a non-contradictory failure message.
+    """
+    from unittest.mock import MagicMock, patch
+    from app.explainability.explanation_result import ExplanationResult
+
+    mock_error_result = ExplanationResult(
+        attack_name="fgsm",
+        technique="shap",
+        clean_prediction=0,
+        adversarial_prediction=1,
+        attribution_status="error",
+        attribution={
+            "clean": {"status": "error", "message": "KernelSHAP failed to compute background summary."},
+            "adversarial": {"status": "error", "message": "KernelSHAP failed to compute background summary."},
+        },
+        metadata={"target_class": 1, "error": "KernelSHAP failed to compute background summary."},
+    )
+
+    dummy_model = nn.Linear(4, 2)
+    dummy_atk = {
+        "attack_name": "fgsm",
+        "original_inputs": torch.randn(2, 4),
+        "adversarial_examples": torch.randn(2, 4),
+        "labels": torch.tensor([0, 1]),
+    }
+
+    with patch("frontend.services.xai_service.XAIExplainer") as mock_explainer_cls:
+        mock_instance = MagicMock()
+        mock_instance.explain.return_value = mock_error_result
+        mock_explainer_cls.return_value = mock_instance
+    with patch("frontend.services.xai_service.XAIExplainer") as mock_explainer_cls:
+        mock_instance = MagicMock()
+        mock_instance.explain.return_value = mock_error_result
+        mock_instance.explain_attack_result.return_value = mock_error_result
+        mock_explainer_cls.return_value = mock_instance
+
+        res = explain_assessment(
+            model=dummy_model,
+            attack_result=dummy_atk,
+            domain="tabular",
+            technique="shap",
+            target_class=1,
+        )
+
+        assert res["executed"] is False
+        assert res["status"] == "error"
+        # Must NOT claim successful generation when explainer status is error
+        assert "Generated SHAP explanation for class 1." not in res["message"]
+        assert "KernelSHAP failed" in res["message"] or "failed with status" in res["message"]
+
+
+def test_xai_diagnostic_controls_default_sample_behavior():
+    """Verify explain_assessment operates with standard default sample behavior when sample_index is omitted."""
+    dummy_model = nn.Linear(4, 2)
+    dummy_atk = {
+        "attack_name": "fgsm",
+        "original_inputs": torch.randn(3, 4),
+        "adversarial_examples": torch.randn(3, 4),
+        "labels": torch.tensor([0, 1, 0]),
+        "original_predictions": [0, 1, 0],
+        "adversarial_predictions": [1, 1, 0],
+    }
+
+    res = explain_assessment(
+        model=dummy_model,
+        attack_result=dummy_atk,
+        domain="tabular",
+        technique="saliency",
+        mode="fast",
+        sample_index=None,  # default behavior without UI sample selector
+    )
+
+    assert res["executed"] is True
+    assert res["status"] == "success"
+    assert res["clean_prediction"] is not None
+
+
+def test_batch_shap_success_and_attribution_table():
+    """Verify batch SHAP execution produces valid results, drift, and renders attribution table."""
+    import torch
+    import torch.nn as nn
+    from frontend.services.xai_service import explain_assessment
+    from frontend.components.xai_visualizer import render_clean_vs_adversarial_attribution_table
+
+    class TabularNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(6, 2)
+
+        def forward(self, x):
+            return self.fc(x)
+
+    model = TabularNet()
+    clean = torch.randn(3, 6)
+    adv = clean + 0.05 * torch.randn_like(clean)
+    atk = {
+        "attack_name": "fgsm",
+        "original_inputs": clean,
+        "adversarial_examples": adv,
+        "labels": torch.tensor([0, 1, 0]),
+        "original_predictions": [0, 1, 0],
+        "adversarial_predictions": [1, 1, 0],
+    }
+
+    res = explain_assessment(
+        model=model,
+        attack_result=atk,
+        domain="tabular",
+        technique="shap",
+        mode="fast",
+    )
+
+    assert res["executed"] is True
+    assert res["status"] == "success"
+    assert "Generated batch SHAP explanations (3 samples)." in res["message"]
+    assert res["clean_prediction"] is not None
+    assert res["adversarial_prediction"] is not None
+    assert res["attribution_drift"] is not None
+
+    local_exp = res.get("local_explanation", {})
+    clean_top = local_exp.get("clean_top_features", [])
+    adv_top = local_exp.get("adversarial_top_features", [])
+    assert len(clean_top) > 0
+    assert len(adv_top) > 0
+
+    # Test that clean vs adversarial attribution table renders cleanly
+    rendered = render_clean_vs_adversarial_attribution_table(res)
+    assert rendered is True
+
+
+def test_batch_shap_partial_and_error_preservation():
+    """Verify that when samples fail in a batch, original errors and failed sample indices are preserved."""
+    from unittest.mock import MagicMock, patch
+    from app.explainability.explanation_result import ExplanationResult
+    from frontend.services.xai_service import explain_assessment
+
+    succ_exp = ExplanationResult(
+        attack_name="fgsm",
+        technique="shap",
+        clean_prediction=0,
+        adversarial_prediction=0,
+        attribution_status="success",
+        attribution={"clean": {"status": "success"}, "adversarial": {"status": "success"}},
+        feature_importance={"clean_top_features": [{"feature": "f1", "importance": 0.5}]},
+    )
+    fail_exp = ExplanationResult(
+        attack_name="fgsm",
+        technique="shap",
+        clean_prediction=1,
+        adversarial_prediction=0,
+        attribution_status="error",
+        attribution={"clean": {"status": "error", "message": "KernelSHAP: singular matrix error"}, "adversarial": {"status": "error"}},
+        metadata={"error": "KernelSHAP: singular matrix error"},
+    )
+
+    dummy_model = nn.Linear(4, 2)
+    dummy_atk = {
+        "attack_name": "fgsm",
+        "original_inputs": torch.randn(2, 4),
+        "adversarial_examples": torch.randn(2, 4),
+        "labels": torch.tensor([0, 1]),
+    }
+
+    with patch("frontend.services.xai_service.XAIExplainer") as mock_explainer_cls:
+        mock_instance = MagicMock()
+        # Case A: Partial batch (sample 0 succeeded, sample 1 failed)
+        mock_instance.explain_attack_result.return_value = [succ_exp, fail_exp]
+        mock_explainer_cls.return_value = mock_instance
+
+        res_partial = explain_assessment(
+            model=dummy_model,
+            attack_result=dummy_atk,
+            domain="tabular",
+            technique="shap",
+        )
+        assert res_partial["status"] == "partial"
+        assert res_partial["executed"] is True
+        assert "1/2 succeeded" in res_partial["message"]
+        assert "KernelSHAP: singular matrix error" in res_partial["message"]
+
+        # Case B: All failed
+        mock_instance.explain_attack_result.return_value = [fail_exp, fail_exp]
+        res_fail = explain_assessment(
+            model=dummy_model,
+            attack_result=dummy_atk,
+            domain="tabular",
+            technique="shap",
+        )
+        assert res_fail["status"] == "error"
+        assert res_fail["executed"] is False
+        assert "failed on sample 0: KernelSHAP: singular matrix error" in res_fail["message"]
+
+
+def test_shap_effective_evals_for_wide_tabular():
+    """Verify that wide tabular data (e.g. 30 features) does not crash with max_evals too low."""
+    from app.explainability.techniques.shap_explainer import SHAPExplainer
+
+    explainer = SHAPExplainer()
+    # 30 features model
+    model = nn.Linear(30, 2)
+    inputs = torch.randn(1, 30)
+    bg = torch.zeros(1, 30)
+
+    # Calling with shap_max_evals=50 on 30 features would crash without effective_max_evals adjustment
+    res = explainer.explain(
+        model=model,
+        inputs=inputs,
+        background_inputs=bg,
+        shap_max_evals=50,
+        output_mode="classification",
+    )
+    assert res["status"] == "success"
+    assert res["executed"] is True
+    assert res["attribution"] is not None
+
+
+def test_clean_vs_adversarial_attribution_table_alignment_and_no_spurious_na():
+    """Verify that full attribution arrays and contributing features eliminate spurious N/A in the attribution table."""
+    import numpy as np
+    import streamlit as st
+    from frontend.components.xai_visualizer import render_clean_vs_adversarial_attribution_table
+
+    # 1. Test with contributing_features (both clean and adv present)
+    xai_contrib = {
+        "contributing_features": [
+            {
+                "feature": "patch_(1,1)",
+                "clean_importance": 0.45,
+                "adversarial_importance": 0.95,
+                "importance_shift": 0.50,
+            },
+            {
+                "feature": "patch_(0,2)",
+                "clean_importance": 0.10,
+                "adversarial_importance": 0.60,
+                "importance_shift": 0.50,
+            },
+        ]
+    }
+    rendered = render_clean_vs_adversarial_attribution_table(xai_contrib)
+    assert rendered is True
+
+    # 2. Test with full clean and adversarial vectors (image/tabular)
+    xai_vectors = {
+        "clean_attribution": np.array([0.1, 0.5, 0.2, 0.0]),
+        "adversarial_attribution": np.array([0.9, 0.4, 0.3, 0.1]),
+        "feature_names": ["feat_A", "feat_B", "feat_C", "feat_D"],
+    }
+    rendered_vec = render_clean_vs_adversarial_attribution_table(xai_vectors)
+    assert rendered_vec is True
+
+    # 3. Test with disjoint top features where full vectors resolve missing values
+    xai_disjoint = {
+        "local_explanation": {
+            "clean_top_features": [{"feature": "f0", "importance": 0.8}],
+            "adversarial_top_features": [{"feature": "f1", "importance": 0.9}],
+        },
+        "clean_attribution": np.array([0.8, 0.1]),
+        "adversarial_attribution": np.array([0.2, 0.9]),
+        "feature_names": ["f0", "f1"],
+    }
+    rendered_disjoint = render_clean_vs_adversarial_attribution_table(xai_disjoint)
+    assert rendered_disjoint is True
+
+
+def test_root_cause_and_attack_impact_dashboard_cards():
+    """Verify Section D (Root Cause) and Section E (Attack Impact) render structured backend results."""
+    from frontend.components.xai_visualizer import (
+        render_root_cause_analysis_card,
+        render_attack_impact_and_vulnerability_card,
+    )
+
+    xai_data = {
+        "clean_prediction": 0,
+        "adversarial_prediction": 1,
+        "clean_confidence": 0.98,
+        "adversarial_confidence": 0.87,
+        "prediction_changed": True,
+        "attack_caused_failure": True,
+        "attack_name": "PGD",
+        "attack_reason": "Adversarial gradient alignment concentrated in high-frequency spatial frequencies.",
+        "perturbation_metrics": {"linf": 0.0313, "l2": 0.542},
+        "perturbation_alignment": 0.784,
+        "failure_analysis": {
+            "failure_mode": "clean_correct_to_adversarial_incorrect",
+            "attack_objective": "untargeted",
+        },
+    }
+
+    render_root_cause_analysis_card(xai_data)
+    render_attack_impact_and_vulnerability_card(xai_data)
+
+
+def test_defense_recommendations_and_technical_diagnostics_sections():
+    """Verify Section F (Candidate Defense Recommendations) and Section G (Technical Diagnostics)."""
+    from frontend.components.xai_visualizer import (
+        render_defense_recommendations_section,
+        render_technical_diagnostics_section,
+        render_dynamic_xai_dashboard,
+    )
+
+    xai_data = {
+        "technique": "shap",
+        "modality": "vision",
+        "status": "success",
+        "executed": True,
+        "clean_prediction": 2,
+        "adversarial_prediction": 7,
+        "clean_confidence": 0.95,
+        "adversarial_confidence": 0.89,
+        "prediction_changed": True,
+        "attack_caused_failure": True,
+        "attribution_drift": 0.654,
+        "feature_salience_distortion": 0.432,
+        "defense_hints": [
+            {
+                "finding": "High attribution drift concentrated in spatial patches",
+                "recommended_technique": "Spatial Squeezing & Median Blur Denoising",
+                "suggested_family": "Input Transformation & Denoising",
+                "defense_stage": "Input Stage",
+                "confidence": "High (88% Attribution Share)",
+                "evidence": {"attribution_drift": 0.654, "perturbation_alignment": 0.7854},
+                "why_recommended": "High-frequency adversarial noise can be attenuated via spatial smoothing.",
+                "expected_benefit": "Reduces high-frequency gradient exploitability.",
+                "limitations": "May slightly blur fine visual details.",
+            }
+        ],
+        "defense_pipeline": {
+            "1_preprocessing": {
+                "stage": "1. Preprocessing",
+                "techniques": ["Bit-depth reduction", "Spatial normalization"],
+            },
+            "2_transformation": {
+                "stage": "2. Transformation",
+                "techniques": ["Discrete Cosine Transform (DCT)"],
+            },
+            "3_detection": {
+                "stage": "3. Detection",
+                "techniques": ["Autoencoder reconstruction filter"],
+            },
+            "6_ensemble": {
+                "stage": "6. Ensemble",
+                "techniques": ["Adversarial Training (PGD-AT)"],
+            },
+        },
+        "metadata": {
+            "execution_time_seconds": 1.42,
+            "explain_seconds": 1.42,
+            "total_pipeline_seconds": 1.55,
+            "device": "cpu",
+            "routing_decision": "Selected SHAP permutation explainer for model-agnostic feature importance.",
+        },
+        "batch_counts": {"total": 5, "succeeded": 5, "failed": 0},
+    }
+
+    render_defense_recommendations_section(xai_data)
+    render_technical_diagnostics_section(xai_data)
+    # Ensure full dashboard orchestration runs smoothly
+    render_dynamic_xai_dashboard(xai_data)
+
+
+def test_perturbation_alignment_computation_and_patch_pooling():
+    """Verify perturbation alignment handles valid matching vectors, spatial patches, and incompatible shapes."""
+    import numpy as np
+    from app.explainability.metrics.perturbation_alignment import compute_perturbation_alignment
+
+    # 1. 1D matching inputs
+    clean_1d = np.array([1.0, 2.0, 3.0, 4.0])
+    adv_1d = np.array([1.1, 2.5, 3.0, 4.8])
+    attr_1d = np.array([0.1, 0.5, 0.0, 0.8])
+    res_1d = compute_perturbation_alignment(clean_1d, adv_1d, attr_1d)
+    assert res_1d["alignment_status"] == "success"
+    assert res_1d["cosine_alignment"] is not None
+    assert 0.0 <= res_1d["cosine_alignment"] <= 1.0
+
+    # 2. 2D patch-pooled alignment (28x28 image vs 7x7 patch attributions)
+    clean_img = np.ones((1, 28, 28))
+    adv_img = np.ones((1, 28, 28))
+    adv_img[:, :4, :4] += 0.5  # Perturb top-left 4x4 patch
+    attr_patch = np.zeros((7, 7))
+    attr_patch[0, 0] = 1.0  # Top-left patch is most important
+    res_patch = compute_perturbation_alignment(clean_img, adv_img, attr_patch)
+    assert res_patch["alignment_status"] == "success"
+    assert res_patch["cosine_alignment"] is not None
+    assert res_patch["cosine_alignment"] > 0.9
+
+    # 3. Incompatible dimensions
+    attr_mismatch = np.zeros((5, 5))  # 5 does not divide 28
+    res_mismatch = compute_perturbation_alignment(clean_img, adv_img, attr_mismatch)
+    assert res_mismatch["alignment_status"] == "shape_mismatch"
+    assert res_mismatch["cosine_alignment"] is None
+    assert "cannot be aligned" in res_mismatch["message"]
+
+    # 4. Missing inputs
+    res_missing = compute_perturbation_alignment(None, adv_img, attr_patch)
+    assert res_missing["alignment_status"] == "unavailable"
+    assert res_missing["cosine_alignment"] is None
+
+
+def test_attack_impact_card_rendering_and_status_descriptions():
+    """Verify Section E renders perturbation alignment value, mismatch reasons, and missing values cleanly."""
+    from frontend.components.xai_visualizer import render_attack_impact_and_vulnerability_card
+
+    # Alignment as scalar
+    render_attack_impact_and_vulnerability_card({
+        "attack_name": "PGD",
+        "perturbation_alignment": 0.8123,
+        "perturbation_metrics": {"linf": 0.03, "l2": 0.45},
+    })
+
+    # Alignment as dict with success
+    render_attack_impact_and_vulnerability_card({
+        "attack_name": "FGSM",
+        "perturbation_alignment": {"alignment_status": "success", "cosine_alignment": 0.654},
+        "perturbation_metrics": {"linf": 0.05},
+    })
+
+    # Alignment as dict with shape mismatch
+    render_attack_impact_and_vulnerability_card({
+        "attack_name": "HopSkipJump",
+        "perturbation_alignment": {
+            "alignment_status": "shape_mismatch",
+            "message": "Attribution features (10) != perturbation features (20)",
+            "cosine_alignment": None,
+        },
+    })
+
+    # Missing alignment
+    render_attack_impact_and_vulnerability_card({
+        "attack_name": "Boundary",
+        "perturbation_alignment": None,
+    })
+
+
+def test_defense_recommendations_no_raw_html_and_empty_descriptions():
+    """Verify Section F renders clean formatting without raw HTML when fields are empty or structured."""
+    from frontend.components.xai_visualizer import render_defense_recommendations_section
+
+    # Test with empty descriptions and missing rationale
+    xai_sparse = {
+        "modality": "tabular",
+        "defense_hints": [
+            {
+                "finding": "Coordinate shift on features",
+                "recommended_technique": "Feature Squeezing & Range Clamping",
+                "suggested_family": "Input Squeezing & Validation",
+                "defense_stage": "Input Stage",
+                "confidence": None,
+                "evidence": {},
+                "why_recommended": "",
+                "expected_benefit": "",
+                "limitations": "",
+                "rationale": "",
+            }
+        ],
+        "recommended_defenses": [],
+        "defense_pipeline": {},
+    }
+    render_defense_recommendations_section(xai_sparse)
+
+
+def test_execution_time_propagation_in_service_and_diagnostics():
+    """Verify execution time is measured, propagated, and formatted without N/A."""
+    from frontend.components.xai_visualizer import render_technical_diagnostics_section
+
+    # With measured time
+    xai_timed = {
+        "metadata": {
+            "execution_time_seconds": 0.842,
+            "total_pipeline_seconds": 0.912,
+            "device": "cpu",
+            "routing_decision": "Model-agnostic KernelSHAP explainer.",
+        },
+        "batch_counts": {"total": 1, "succeeded": 1, "failed": 0},
+    }
+    render_technical_diagnostics_section(xai_timed)
+
+    # With explain_seconds
+    xai_explain_sec = {
+        "metadata": {
+            "explain_seconds": 1.234,
+            "device": "cuda",
+        },
+        "batch_counts": {"total": 2, "succeeded": 2, "failed": 0},
+    }
+    render_technical_diagnostics_section(xai_explain_sec)
+
+    # Missing metadata
+    xai_no_meta = {}
+    render_technical_diagnostics_section(xai_no_meta)
+
+
+
+
+
+
+
+
+
+
