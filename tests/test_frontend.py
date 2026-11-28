@@ -63,6 +63,8 @@ def test_get_available_defenses_for_domain():
 def test_execute_configured_defense_specific():
     """Verify specific defense execution with real tensors."""
     model = SimpleVisionModel()
+    model.input_shape = (3, 32, 32)
+    model.num_classes = 2
     inputs = torch.rand(4, 3, 16, 16)
     labels = torch.tensor([0, 1, 0, 1])
     adv_inputs = inputs + 0.05 * torch.randn_like(inputs)
@@ -104,6 +106,8 @@ def test_execute_configured_defense_specific():
 def test_execute_configured_defense_auto_and_fallback():
     """Verify auto iterative defense execution with fallback."""
     model = SimpleVisionModel()
+    model.input_shape = (3, 32, 32)
+    model.num_classes = 2
     inputs = torch.rand(4, 3, 16, 16)
     labels = torch.tensor([0, 1, 0, 1])
     adv_inputs = inputs + 0.08 * torch.randn_like(inputs)
@@ -269,6 +273,8 @@ def test_targeted_attack_execution_and_propagation():
     from frontend.services.attack_service import execute_configured_attack
 
     model = SimpleVisionModel()
+    model.input_shape = (3, 32, 32)
+    model.num_classes = 2
     inputs = torch.rand(4, 3, 16, 16)
     labels = torch.tensor([0, 0, 0, 0])
 
@@ -303,6 +309,8 @@ def test_asr_denominator_and_clean_misclassification_handling():
     from frontend.services.attack_service import execute_configured_attack
 
     model = SimpleVisionModel()
+    model.input_shape = (3, 32, 32)
+    model.num_classes = 2
     inputs = torch.rand(4, 3, 16, 16)
     
     # Get model's clean predictions and invert them so all samples are cleanly misclassified
@@ -328,6 +336,8 @@ def test_asr_denominator_and_clean_misclassification_handling():
 def test_defense_service_rejects_missing_adversarial_tensor():
     """Verify defense execution never substitutes clean inputs for missing adversarial examples (A08)."""
     model = SimpleVisionModel()
+    model.input_shape = (3, 32, 32)
+    model.num_classes = 2
     inputs = torch.rand(4, 3, 16, 16)
     labels = torch.tensor([0, 1, 0, 1])
 
@@ -356,6 +366,8 @@ def test_vulnerability_service_authentic_scoring_and_explanations():
     from frontend.services.vulnerability_service import assess_and_score_vulnerability
 
     model = SimpleVisionModel()
+    model.input_shape = (3, 32, 32)
+    model.num_classes = 2
     inputs = torch.rand(4, 3, 16, 16)
     labels = torch.tensor([0, 1, 0, 1])
     adv_inputs = inputs + 0.08 * torch.randn_like(inputs)
@@ -406,12 +418,15 @@ def test_synthetic_dataset_fallback_flagging():
     from frontend.services.ingestion_service import load_model_and_dataset
 
     model = SimpleVisionModel()
+    model.input_shape = (3, 32, 32)
+    model.num_classes = 2
     # Attempting to load non-existent dataset will trigger synthetic fallback
     res = load_model_and_dataset(
         model_identifier=model,
         dataset_name="non_existent_dataset_abc_123",
         data_domain="image",
         sample_size=4,
+        allow_synthetic_fallback=True,
     )
 
     assert res["is_synthetic_dataset"] is True
@@ -624,6 +639,8 @@ def test_report_generation_with_vulnerability_and_defense_results():
 def test_defense_execution_batch_size_alignment():
     """Verify execute_configured_defense safely aligns batch sizes when clean inputs/labels have 10 samples and adversarial has 5."""
     model = SimpleVisionModel()
+    model.input_shape = (3, 32, 32)
+    model.num_classes = 2
     inputs_10 = torch.randn(10, 3, 32, 32)
     labels_10 = torch.randint(0, 2, (10,))
     adv_5 = inputs_10[:5] + 0.05
@@ -654,6 +671,8 @@ def test_defense_execution_batch_size_alignment():
 def test_execute_configured_defense_asr_zero_short_circuit():
     """Verify that when baseline attack ASR is 0.0%, defense hardening is short-circuited."""
     model = SimpleVisionModel()
+    model.input_shape = (3, 32, 32)
+    model.num_classes = 2
     inputs = torch.randn(4, 3, 16, 16)
     labels = torch.tensor([0, 1, 0, 1])
     adv_inputs = inputs + 0.01
@@ -722,6 +741,8 @@ def test_class_labels_mapping_and_targeted_attack_telemetry():
 
     # 2. Test targeted attack telemetry execution
     model = SimpleVisionModel()
+    model.input_shape = (3, 32, 32)
+    model.num_classes = 2
     inputs = torch.randn(4, 3, 32, 32)
     labels = torch.zeros(4, dtype=torch.long)  # All ground truth = 0
 
@@ -799,6 +820,8 @@ def test_cw_dynamic_attack_parameters_has_no_alpha():
 
     # Test backend execution with CW parameters
     model = SimpleVisionModel()
+    model.input_shape = (3, 32, 32)
+    model.num_classes = 2
     inputs = torch.rand(2, 3, 16, 16)
     labels = torch.tensor([0, 1])
     res = execute_configured_attack(
@@ -883,6 +906,8 @@ def test_batched_attack_execution_prevents_oom():
     from frontend.services.attack_service import execute_configured_attack
 
     model = SimpleVisionModel()
+    model.input_shape = (3, 32, 32)
+    model.num_classes = 2
     # 70 vision samples exceeds vision chunk size (32) to test multi-chunk execution & concatenation
     inputs = torch.rand(70, 3, 16, 16)
     labels = torch.randint(0, 2, (70,))

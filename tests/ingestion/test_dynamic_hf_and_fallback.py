@@ -85,6 +85,7 @@ def test_generate_domain_sample_batch_dynamic_tabular_discovery():
         pytest.skip("frontend.services.ingestion_service not available on this branch")
     class DummySklearnModel:
         n_features_in_ = 30
+        classes_ = [0, 1]
 
     meta = ModelMetadata(model_id="test-tabular", framework="sklearn", data_domain="tabular", task_type="classification")
     inputs, labels = _generate_domain_sample_batch(meta, sample_size=5, raw_model=DummySklearnModel())

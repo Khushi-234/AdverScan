@@ -3,6 +3,7 @@ Hugging Face model loader implementation for vision, text, time-series, and tabu
 """
 
 import json
+import logging
 from typing import Any, Optional, Union
 import torch
 import torch.nn as nn
@@ -17,8 +18,10 @@ from transformers import (
     ViTConfig,
 )
 
-from app.ingestion.exceptions import ModelLoadError, UnsupportedTaskError
+from app.ingestion.exceptions import ErrorCategory, ModelLoadError, UnsupportedTaskError
 from app.ingestion.loader.base_loader import BaseModelLoader
+
+logger = logging.getLogger(__name__)
 
 
 def load_keras_or_savedmodel(local_path: str) -> Any:
@@ -131,6 +134,7 @@ class HuggingFaceLoader(BaseModelLoader):
         device: Optional[Union[str, torch.device]] = None,
         domain: Optional[str] = None,
         task_type: Optional[str] = "classification",
+        trust_remote_code: bool = False,
         **kwargs: Any
     ) -> nn.Module:
         """
@@ -180,15 +184,28 @@ class HuggingFaceLoader(BaseModelLoader):
         hf_info = detect_hf_repo_info(model_id)
 
         repo_type = hf_info.get("repo_type")
+        if hf_info.get("rejection_reason") == "R1" or repo_type in ("not_found", "private_or_gated") or hf_info.get("error"):
+            err_msg = hf_info.get("error") or f"Repository '{model_id}' is not found, private, or gated."
+            raise ModelLoadError(
+                f"Cannot access Hugging Face repository '{model_id}' ({repo_type}): {err_msg}",
+                rejection_reason="R1",
+            )
         if repo_type == "dataset":
             raise ModelLoadError(
                 f"Hugging Face repository '{model_id}' appears to be a dataset repository, not a model repository. "
-                f"Available files: {hf_info.get('files', [])}"
+                f"Available files: {hf_info.get('files', [])}",
+                rejection_reason="R2",
             )
         if repo_type == "source_only":
             raise ModelLoadError(
                 f"Hugging Face repository '{model_id}' contains only source code/documentation and no serialized model weights. "
-                f"Available files: {hf_info.get('files', [])}"
+                f"Available files: {hf_info.get('files', [])}",
+                rejection_reason="R2",
+            )
+        if repo_type == "empty":
+            raise ModelLoadError(
+                f"Hugging Face repository '{model_id}' contains no files.",
+                rejection_reason="R2",
             )
 
         if hf_info.get("framework") in ("xgboost", "lightgbm", "catboost"):
@@ -205,12 +222,14 @@ class HuggingFaceLoader(BaseModelLoader):
                 from huggingface_hub import snapshot_download
                 local_dir = snapshot_download(model_id)
                 return load_keras_or_savedmodel(local_dir)
-            except ImportError:
+            except ImportError as imp_err:
                 raise ModelLoadError(
                     f"Hugging Face repository '{model_id}' contains a TensorFlow/Keras SavedModel, "
                     f"which requires the 'tensorflow' package. TensorFlow is not installed in the current environment. "
-                    f"Please install 'tensorflow' to ingest and evaluate TensorFlow/Keras models."
-                )
+                    f"Please install 'tensorflow' to ingest and evaluate TensorFlow/Keras models.",
+                    category=ErrorCategory.MISSING_DEPENDENCY,
+                    rejection_reason="R6",
+                ) from imp_err
 
         if hf_info.get("framework") == "onnx":
             try:
@@ -222,11 +241,13 @@ class HuggingFaceLoader(BaseModelLoader):
                     raise ModelLoadError(f"No .onnx model file found in Hugging Face repository '{model_id}'.")
                 local_onnx = hf_hub_download(model_id, onnx_file)
                 return onnxruntime.InferenceSession(local_onnx)
-            except ImportError:
+            except ImportError as imp_err:
                 raise ModelLoadError(
                     f"Hugging Face repository '{model_id}' contains an ONNX model, which requires 'onnxruntime'. "
-                    f"onnxruntime is not installed in the current environment."
-                )
+                    f"onnxruntime is not installed in the current environment.",
+                    category=ErrorCategory.MISSING_DEPENDENCY,
+                    rejection_reason="R6",
+                ) from imp_err
 
         if hf_info.get("framework") == "jax":
             raise UnsupportedTaskError(
@@ -243,6 +264,7 @@ class HuggingFaceLoader(BaseModelLoader):
         try:
             # Remove loader-specific kwargs unsupported by Hugging Face AutoModel.from_pretrained
             kwargs.pop("unsafe_allow_pickle", None)
+            trust_remote_code = bool(trust_remote_code or kwargs.pop("allow_remote_code", False))
 
             # 1. Download/read config.json to perform config patching and task verification
             model_config = None
@@ -332,7 +354,7 @@ class HuggingFaceLoader(BaseModelLoader):
                 except Exception as e:
                     last_exc = e
                     try:
-                        auto_kwargs = {"trust_remote_code": True, **kwargs}
+                        auto_kwargs = {"trust_remote_code": trust_remote_code, **kwargs}
                         if model_config is not None:
                             auto_kwargs["config"] = model_config
                         model = AutoModel.from_pretrained(model_id, **auto_kwargs)
@@ -358,7 +380,7 @@ class HuggingFaceLoader(BaseModelLoader):
                 except Exception as e:
                     last_exc = e
                     try:
-                        auto_kwargs = {"trust_remote_code": True, **kwargs}
+                        auto_kwargs = {"trust_remote_code": trust_remote_code, **kwargs}
                         if model_config is not None:
                             auto_kwargs["config"] = model_config
                         model = AutoModel.from_pretrained(model_id, **auto_kwargs)
@@ -407,14 +429,27 @@ class HuggingFaceLoader(BaseModelLoader):
                 # 3. Fallback to AutoModel
                 if model is None:
                     try:
-                        model = AutoModel.from_pretrained(model_id, trust_remote_code=True, **kwargs)
+                        auto_kwargs = {"trust_remote_code": trust_remote_code, **kwargs}
+                        if model_config is not None:
+                            auto_kwargs["config"] = model_config
+                        model = AutoModel.from_pretrained(model_id, **auto_kwargs)
                     except Exception as e:
                         last_exc = e
                         model = None
 
             if model is None:
                 err_detail = f": {last_exc}" if last_exc else "."
-                raise ModelLoadError(f"Could not load Hugging Face model '{model_id}' for domain '{domain_str}'{err_detail}")
+                err_lower = str(last_exc).lower() if last_exc else ""
+                if not trust_remote_code and ("trust_remote_code" in err_lower or "custom code" in err_lower):
+                    raise ModelLoadError(
+                        f"Model '{model_id}' requires executing remote custom code (`trust_remote_code=True`). "
+                        f"Explicit user consent is required before loading custom code.",
+                        category=ErrorCategory.CONSENT,
+                        rejection_reason="R3",
+                    ) from last_exc
+                raise ModelLoadError(
+                    f"Could not load Hugging Face model '{model_id}' for domain '{domain_str}'{err_detail}"
+                ) from last_exc
 
             model.to(map_location)
             model.eval()

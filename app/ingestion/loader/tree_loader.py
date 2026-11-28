@@ -7,14 +7,20 @@ preprocessing, calibration, and metadata artifacts from local disk and Hugging F
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from app.ingestion.exceptions import (
+    ErrorCategory,
     ModelLoadError,
+    UnsafeModelError,
     UnsupportedModelError,
+    classify_exception,
 )
 from app.ingestion.loader.base_loader import BaseModelLoader
+
+logger = logging.getLogger(__name__)
 
 
 class TreeModelLoader(BaseModelLoader):
@@ -137,6 +143,26 @@ class TreeModelLoader(BaseModelLoader):
         if not local_model_file or not local_model_file.exists():
             raise ModelLoadError(f"Model file '{local_model_file}' could not be resolved or does not exist.")
 
+        # Native tree formats (XGBoost json/ubj/model, LightGBM txt/model, CatBoost cbm) need NO pickle consent.
+        # Joblib/pickle estimators DO require explicit consent.
+        if local_model_file.suffix.lower() in (".pkl", ".pickle", ".joblib"):
+            unsafe_allow_pickle = bool(kwargs.pop("unsafe_allow_pickle", False))
+            if not unsafe_allow_pickle:
+                raise UnsafeModelError(
+                    f"Security risk: Refusing to deserialize tree estimator '{local_model_file}' "
+                    f"without explicit user consent (`unsafe_allow_pickle=True`)."
+                )
+            from app.ingestion.loader.sklearn_loader import SklearnLoader
+            return SklearnLoader().load(local_model_file, unsafe_allow_pickle=True, **kwargs)
+
+        # Missing preprocess/calibrator/metadata files = warning only, never failure
+        if not preprocessing_data:
+            logger.warning("No preprocessing metadata found for tree model '%s'; proceeding with raw features.", local_model_file.name)
+        if not calibrator_data:
+            logger.debug("No calibrator metadata found for tree model '%s'.", local_model_file.name)
+        if not metadata_data:
+            logger.warning("No metadata.json found for tree model '%s'; using model-level attributes.", local_model_file.name)
+
         # Default fallback to xgboost if still undetermined
         fw = fw or "xgboost"
 
@@ -173,17 +199,20 @@ class TreeModelLoader(BaseModelLoader):
         """Load native XGBoost Booster."""
         try:
             import xgboost as xgb
-        except ImportError:
+        except ImportError as imp_err:
             raise ModelLoadError(
                 f"Model at '{model_path}' is an XGBoost model, which requires the 'xgboost' package. "
                 f"Please install 'xgboost' via 'pip install xgboost'."
-            )
+            ) from imp_err
 
         try:
             booster = xgb.Booster()
             booster.load_model(str(model_path))
         except Exception as exc:
-            raise ModelLoadError(f"Failed to load XGBoost model from '{model_path}': {exc}") from exc
+            raise ModelLoadError(
+                f"Failed to load XGBoost model from '{model_path}': {exc}",
+                category=classify_exception(exc),
+            ) from exc
 
         # Attach discovered metadata and features
         feat_names = list(booster.feature_names) if booster.feature_names is not None else None
@@ -217,16 +246,19 @@ class TreeModelLoader(BaseModelLoader):
         """Load native LightGBM Booster."""
         try:
             import lightgbm as lgb
-        except ImportError:
+        except ImportError as imp_err:
             raise ModelLoadError(
                 f"Model at '{model_path}' is a LightGBM model, which requires 'lightgbm'. "
                 f"Please install 'lightgbm' via 'pip install lightgbm'."
-            )
+            ) from imp_err
 
         try:
             booster = lgb.Booster(model_file=str(model_path))
         except Exception as exc:
-            raise ModelLoadError(f"Failed to load LightGBM model from '{model_path}': {exc}") from exc
+            raise ModelLoadError(
+                f"Failed to load LightGBM model from '{model_path}': {exc}",
+                category=classify_exception(exc),
+            ) from exc
 
         booster.preprocessing_info = preprocessing_data
         booster.metadata_info = metadata_data
@@ -241,17 +273,20 @@ class TreeModelLoader(BaseModelLoader):
         """Load native CatBoost classifier."""
         try:
             import catboost as cb
-        except ImportError:
+        except ImportError as imp_err:
             raise ModelLoadError(
                 f"Model at '{model_path}' is a CatBoost model, which requires 'catboost'. "
                 f"Please install 'catboost' via 'pip install catboost'."
-            )
+            ) from imp_err
 
         try:
             model = cb.CatBoostClassifier()
             model.load_model(str(model_path))
         except Exception as exc:
-            raise ModelLoadError(f"Failed to load CatBoost model from '{model_path}': {exc}") from exc
+            raise ModelLoadError(
+                f"Failed to load CatBoost model from '{model_path}': {exc}",
+                category=classify_exception(exc),
+            ) from exc
 
         model.preprocessing_info = preprocessing_data
         model.metadata_info = metadata_data

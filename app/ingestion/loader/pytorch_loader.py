@@ -7,7 +7,7 @@ from typing import Any, Optional, Union
 import torch
 import torch.nn as nn
 
-from app.ingestion.exceptions import ModelLoadError
+from app.ingestion.exceptions import ErrorCategory, ModelLoadError
 from app.ingestion.loader.base_loader import BaseModelLoader
 
 
@@ -94,24 +94,42 @@ class PyTorchLoader(BaseModelLoader):
 
             # Case 3: loaded_obj is a state_dict (dictionary of weights)
             if isinstance(loaded_obj, dict):
-                if model_class is None:
-                    raise ModelLoadError(
-                        "State dictionary detected, but the model architecture could not be determined: "
-                        "no model_class or model structure was provided. "
-                        "Please provide the model class or architecture configuration."
-                    )
-                
-                # Instantiate model if model_class is a class, or use instance if already instantiated
-                model = model_class() if isinstance(model_class, type) else model_class
-                if not isinstance(model, nn.Module):
-                    raise ModelLoadError("Provided model_class is not a torch.nn.Module instance or factory.")
-                
                 # Check for nested state_dict keys (e.g., 'state_dict' or 'model_state_dict')
                 state_dict = loaded_obj
                 for key in ["state_dict", "model_state_dict", "model"]:
                     if key in state_dict and isinstance(state_dict[key], dict):
                         state_dict = state_dict[key]
                         break
+
+                if model_class is None:
+                    model_class = self._resolve_architecture_from_artifacts(path, state_dict)
+
+                if model_class is None:
+                    raise ModelLoadError(
+                        "State dictionary detected, but the model architecture could not be determined: "
+                        "no model_class, Hugging Face config.json, or timm/torchvision architecture matched. "
+                        "Please provide the model class or architecture configuration.",
+                        category=ErrorCategory.ARCH_UNKNOWN,
+                        rejection_reason="R3",
+                    )
+
+                # Instantiate model if model_class is a class, or use instance if already instantiated
+                model = model_class() if isinstance(model_class, type) else model_class
+                if not isinstance(model, nn.Module):
+                    raise ModelLoadError("Provided model_class is not a torch.nn.Module instance or factory.")
+
+                # Verify state_dict key shapes match before accepting
+                target_sd = model.state_dict()
+                matched_keys = [
+                    k for k, v in state_dict.items()
+                    if k in target_sd and hasattr(v, "shape") and tuple(v.shape) == tuple(target_sd[k].shape)
+                ]
+                if not matched_keys:
+                    raise ModelLoadError(
+                        f"Resolved architecture '{type(model).__name__}' does not match state_dict parameter shapes.",
+                        category=ErrorCategory.ARCH_UNKNOWN,
+                        rejection_reason="R3",
+                    )
 
                 model.load_state_dict(state_dict)
                 model.eval()
@@ -125,3 +143,77 @@ class PyTorchLoader(BaseModelLoader):
             raise
         except Exception as e:
             raise ModelLoadError(f"Failed to load PyTorch model from {path}: {str(e)}") from e
+
+    @staticmethod
+    def _resolve_architecture_from_artifacts(path: Path, state_dict: dict) -> Optional[Any]:
+        """Try resolving a PyTorch architecture from sibling config.json or README.md without guessing."""
+        import json
+        parent = path.parent
+        cfg_path = parent / "config.json"
+        if cfg_path.is_file():
+            try:
+                cfg_dict = json.loads(cfg_path.read_text(encoding="utf-8"))
+                archs = cfg_dict.get("architectures") or []
+                if archs:
+                    import transformers
+                    from transformers import CONFIG_MAPPING
+                    m_type = cfg_dict.get("model_type", "")
+                    if m_type and m_type in CONFIG_MAPPING:
+                        from app.ingestion.loader.huggingface_loader import patch_hf_config
+                        cfg_obj = CONFIG_MAPPING[m_type].from_dict(patch_hf_config(cfg_dict))
+                        for arch in archs:
+                            if hasattr(transformers, arch):
+                                cls = getattr(transformers, arch)
+                                return lambda cls=cls, cfg_obj=cfg_obj: cls(cfg_obj)
+                arch_name = cfg_dict.get("architecture") or cfg_dict.get("model_name")
+                if isinstance(arch_name, str) and arch_name.strip():
+                    inst = PyTorchLoader._try_timm_or_torchvision(arch_name.strip(), state_dict)
+                    if inst is not None:
+                        return inst
+            except Exception:
+                pass
+
+        readme_path = parent / "README.md"
+        if readme_path.is_file():
+            try:
+                text = readme_path.read_text(encoding="utf-8", errors="ignore")[:8192]
+                from app.ingestion.utils.model_utils import _parse_yaml_frontmatter
+                meta = _parse_yaml_frontmatter(text)
+                for key in ("model_name", "architecture", "base_model"):
+                    cand = meta.get(key)
+                    if isinstance(cand, str) and cand.strip():
+                        inst = PyTorchLoader._try_timm_or_torchvision(cand.strip(), state_dict)
+                        if inst is not None:
+                            return inst
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _try_timm_or_torchvision(name: str, state_dict: dict) -> Optional[nn.Module]:
+        """Instantiate a timm or torchvision architecture by explicit name if shapes match."""
+        clean = name.split("/")[-1].strip()
+        num_classes = None
+        for k, v in state_dict.items():
+            if any(k.endswith(s) for s in ("fc.weight", "classifier.weight", "head.weight", "head.fc.weight")) and hasattr(v, "shape") and len(v.shape) == 2:
+                num_classes = int(v.shape[0])
+                break
+        try:
+            import timm
+            if clean in timm.list_models():
+                kwargs = {"pretrained": False}
+                if num_classes:
+                    kwargs["num_classes"] = num_classes
+                return timm.create_model(clean, **kwargs)
+        except Exception:
+            pass
+        try:
+            import torchvision.models as tvm
+            if hasattr(tvm, clean) and callable(getattr(tvm, clean)):
+                kwargs = {"weights": None}
+                if num_classes:
+                    kwargs["num_classes"] = num_classes
+                return getattr(tvm, clean)(**kwargs)
+        except Exception:
+            pass
+        return None

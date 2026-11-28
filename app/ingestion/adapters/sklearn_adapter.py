@@ -49,6 +49,8 @@ class SklearnAdapter(BaseModelAdapter):
         self.threshold = bundle_info.get("threshold")
         self.class_labels = bundle_info.get("classes")
         self.bundle_metadata = bundle_info.get("metadata", {})
+        self.is_reconstructed = bool(getattr(model, "_reconstructed", False))
+        self.reconstructed_reason = getattr(model, "_reconstructed_reason", None)
 
     @property
     def capabilities(self) -> AdapterCapabilities:

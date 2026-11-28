@@ -134,6 +134,33 @@ set_state("theme", current_theme)
 render_sidebar_session()
 
 
+def build_ingestion_kwargs(
+    model_identifier: str,
+    dataset_input: str,
+    data_domain: str,
+    framework: str,
+    device: str,
+    sample_size: int,
+    unsafe_allow_pickle: bool = False,
+    trust_remote_code: bool = False,
+    force_refresh: bool = True,
+    allow_synthetic_fallback: bool = False,
+) -> dict:
+    """Build the exact keyword arguments passed from the UI to load_model_and_dataset()."""
+    return {
+        "model_identifier": model_identifier,
+        "dataset_name": (dataset_input.strip() if str(dataset_input or "").strip() else None),
+        "data_domain": data_domain,
+        "framework": framework,
+        "device": device,
+        "sample_size": sample_size,
+        "unsafe_allow_pickle": bool(unsafe_allow_pickle),
+        "trust_remote_code": bool(trust_remote_code),
+        "force_refresh": bool(force_refresh),
+        "allow_synthetic_fallback": bool(allow_synthetic_fallback),
+    }
+
+
 def ensure_active_scan_id() -> str:
     """Ensure an active scan ID exists in SQLite and session state, creating one if missing."""
     sid = get_active_scan_id()
@@ -309,6 +336,7 @@ elif stage == "ingestion":
             st.session_state["_ingestion_status"] = "idle"
             st.session_state["_ingestion_error"] = None
             st.session_state["_requires_pickle_consent_for"] = None
+            st.session_state["_requires_remote_code_consent_for"] = None
 
         st.caption(
             f"**Preset Description**: {selected_preset_info.get('description', '')} • **Domain**: {DATA_DOMAIN_LABELS.get(default_domain, default_domain.capitalize())}"
@@ -329,6 +357,7 @@ elif stage == "ingestion":
             st.session_state["_ingestion_status"] = "idle"
             st.session_state["_ingestion_error"] = None
             st.session_state["_requires_pickle_consent_for"] = None
+            st.session_state["_requires_remote_code_consent_for"] = None
 
         detected_dom = detect_model_domain(clean_hf_id) if clean_hf_id else "unknown"
         dom_idx = DATA_DOMAIN_OPTIONS.index(detected_dom) if detected_dom in DATA_DOMAIN_OPTIONS else 0
@@ -373,6 +402,7 @@ elif stage == "ingestion":
             st.session_state["_ingestion_status"] = "idle"
             st.session_state["_ingestion_error"] = None
             st.session_state["_requires_pickle_consent_for"] = None
+            st.session_state["_requires_remote_code_consent_for"] = None
 
         detected_dom = detect_model_domain(clean_local_id) if clean_local_id else "unknown"
         dom_idx = DATA_DOMAIN_OPTIONS.index(detected_dom) if detected_dom in DATA_DOMAIN_OPTIONS else 2
@@ -507,29 +537,6 @@ elif stage == "ingestion":
                 """,
                 unsafe_allow_html=True,
             )
-            use_synthetic_explicit = False
-        else:
-            st.markdown(
-                f"""
-                <div style="background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 8px; padding: 10px 14px; margin-top: 6px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span style="font-size: 0.84rem; font-weight: 600; color: #f59e0b; text-transform: uppercase;">
-                            ⚠️ No Evaluation Dataset Resolved
-                        </span>
-                        <span class="badge-status badge-amber">0 REAL SAMPLES</span>
-                    </div>
-                    <div style="font-size: 0.82rem; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">
-                        This model has no associated real evaluation dataset. Provide a CSV/Parquet file path, Hugging Face dataset ID, or upload a dataset above.
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            use_synthetic_explicit = st.checkbox(
-                "Explicitly generate synthetic smoke-test data (for pipeline verification only — NOT valid for empirical ASR/robustness)",
-                value=False,
-                key=f"explicit_synthetic::{model_state_key}",
-            )
 
     with col_sample:
         if dataset_is_resolved and total_avail_samples > 0:
@@ -582,22 +589,31 @@ elif stage == "ingestion":
                 st.caption(
                     f"Selected: **{sample_size:,}** of **{total_avail_samples:,}** samples (**{pct_cov:.1f}%** dataset coverage)"
                 )
-        elif use_synthetic_explicit:
-            sample_size = st.number_input(
-                "Synthetic Smoke-Test Samples",
-                min_value=1,
-                max_value=50,
-                value=5,
-                step=1,
-                key=f"sample_size_synth::{model_state_key}",
-                help="Synthetic smoke-test sample count (explicitly marked synthetic)",
-            )
-            st.warning("⚠️ Synthetic smoke-test mode active. These samples are NOT real benchmark data.")
         else:
             sample_size = 5
-            st.info(
-                "ℹ️ **Model-Only Ingestion Mode**: No evaluation dataset is selected. "
-                "AdverScan will ingest and validate the model, then ask you to supply a dataset before running empirical attacks."
+
+    remote_code_consent = False
+    retry_remote_clicked = False
+    needs_remote_code = (
+        st.session_state.get("_requires_remote_code_consent_for") == model_state_key
+        or bool(summary_info.get("requires_remote_code"))
+    )
+    if needs_remote_code:
+        st.warning(
+            "🔐 **Custom Remote Code Consent Required (`trust_remote_code`)**\n\n"
+            "This Hugging Face repository requires executing custom Python modeling code (`auto_map`) from the repository. "
+            "Only proceed if you trust the repository author."
+        )
+        remote_code_consent = st.checkbox(
+            "I trust this repository and consent to executing remote custom code (`trust_remote_code=True`)",
+            value=False,
+            key=f"remote_code_consent::{model_state_key}",
+        )
+        if st.session_state.get("_requires_remote_code_consent_for") == model_state_key:
+            retry_remote_clicked = st.button(
+                "Retry ingestion",
+                key=f"retry_remote_code::{model_state_key}",
+                disabled=not remote_code_consent,
             )
 
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
@@ -615,7 +631,7 @@ elif stage == "ingestion":
         )
 
     # Ingestion Execution with multi-step progress bar
-    if ingest_clicked:
+    if ingest_clicked or retry_remote_clicked:
         if not model_identifier.strip():
             st.error("Please provide a valid model identifier or path.")
         else:
@@ -649,15 +665,18 @@ elif stage == "ingestion":
                 )
 
                 res_data = load_model_and_dataset(
-                    model_identifier=model_identifier,
-                    dataset_name=(dataset_input.strip() if dataset_input.strip() else None),
-                    data_domain=default_domain,
-                    framework=default_framework,
-                    device=device_opt,
-                    sample_size=sample_size,
-                    unsafe_allow_pickle=bool(unsafe_allow_pickle_consent),
-                    force_refresh=True,
-                    allow_synthetic_fallback=bool(use_synthetic_explicit),
+                    **build_ingestion_kwargs(
+                        model_identifier=model_identifier,
+                        dataset_input=dataset_input,
+                        data_domain=default_domain,
+                        framework=default_framework,
+                        device=device_opt,
+                        sample_size=sample_size,
+                        unsafe_allow_pickle=bool(unsafe_allow_pickle_consent),
+                        trust_remote_code=bool(remote_code_consent),
+                        force_refresh=True,
+                        allow_synthetic_fallback=False,
+                    )
                 )
 
                 progress_bar.progress(
@@ -787,12 +806,20 @@ elif stage == "ingestion":
                 clear_active_assessment()
                 st.session_state["_ingestion_status"] = "failed"
                 st.session_state["_ingestion_error"] = str(err)
+                st.session_state["_ingestion_error_attempts"] = getattr(err, "attempts", [])
+                st.session_state["_ingestion_error_reason"] = getattr(err, "rejection_reason", None)
+                err_str = str(err).lower()
                 if "unsafe_allow_pickle" in str(err) or "Security risk:" in str(err):
                     st.session_state["_requires_pickle_consent_for"] = model_state_key
                     st.rerun()
+                if "trust_remote_code" in err_str or "remote custom code" in err_str:
+                    st.session_state["_requires_remote_code_consent_for"] = model_state_key
+                    st.rerun()
 
     if st.session_state.get("_ingestion_status") == "failed" and st.session_state.get("_ingestion_error"):
-        st.error(f"❌ Ingestion Error: {st.session_state.get('_ingestion_error')}")
+        err_reason = st.session_state.get("_ingestion_error_reason")
+        reason_prefix = f"[{err_reason}] " if err_reason else ""
+        st.error(f"❌ Ingestion Error {reason_prefix}: {st.session_state.get('_ingestion_error')}")
 
     # Display confirmed active model details if loaded and matching current selection
     active_data = get_active_assessment()
@@ -861,6 +888,14 @@ elif stage == "ingestion":
         )
 
         # 3 Structured Modern Cards
+        acc_lvl = active_data.get("acceptance_level", "ACCEPTED_FULL")
+        ds_status = active_data.get("dataset_status", "DATASET_READY" if active_data.get("dataset_resolved") else "DATASET_PENDING")
+        caps = active_data.get("capabilities") or {}
+        st.info(
+            f"**Status:** `{acc_lvl}` | **Dataset:** `{ds_status}` | "
+            f"**Gradients:** `{caps.get('supports_gradients', False)}` | "
+            f"**Predict Proba:** `{caps.get('supports_predict_proba', False)}`"
+        )
         col_c1, col_c2, col_c3 = st.columns(3)
 
         with col_c1:
@@ -949,28 +984,11 @@ elif stage == "ingestion":
                 unsafe_allow_html=True,
             )
 
-        if active_data and active_data.get("is_synthetic_dataset"):
-            fallback_reason_msg = active_data.get("dataset_fallback_reason") or "Real dataset could not be located or loaded"
-            st.error(
-                f"🚨 **CRITICAL WARNING — SYNTHETIC FALLBACK DATA IN USE**\n\n"
-                f"**Failure Reason:** `{fallback_reason_msg}`\n\n"
-                f"**Data Provenance:** Randomly generated synthetic smoke-test samples are populated by explicit user opt-in.\n\n"
-                f"**Methodological Impact:** Synthetic samples **must NOT** be used to claim authentic empirical robustness or ASR results."
-            )
-        elif active_data and not active_data.get("dataset_resolved", True):
-            reason_msg = active_data.get("dataset_fallback_reason") or "No evaluation dataset is associated with this model."
-            st.warning(
-                f"⚠️ **Model Ingested Successfully — Evaluation Dataset Required**\n\n"
-                f"{reason_msg}\n\n"
-                f"Please enter a local CSV/Parquet path, a Hugging Face dataset ID, or upload an evaluation dataset above and re-run ingestion to proceed with empirical evaluation."
-            )
-
         st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
         if st.button(
             "Proceed to Attack Discovery & Configuration →",
             type="primary",
             use_container_width=True,
-            disabled=bool(active_data and not active_data.get("dataset_resolved", True)),
         ):
             set_workflow_stage("attack_config")
             st.rerun()
@@ -997,20 +1015,40 @@ elif stage == "attack_config":
             st.rerun()
         st.stop()
 
-    # Empirical attack evaluation guard (Requirement 8 & 9: Require real evaluation dataset)
+    # Empirical attack evaluation guard (Require real evaluation dataset)
     missing_real_dataset = (
         not active_data.get("dataset_resolved")
         or active_data.get("is_synthetic_dataset")
         or active_data.get("test_inputs") is None
     )
     if missing_real_dataset:
-        fallback_reason_msg = active_data.get("dataset_fallback_reason") or "No real evaluation dataset is loaded"
-        st.error(
-            f"🚫 **Empirical Attack Evaluation Blocked — No Real Evaluation Dataset Loaded**\n\n"
-            f"**Reason:** `{fallback_reason_msg}`\n\n"
-            f"**Policy:** AdverScan does **not** calculate or report empirical ASR or robustness metrics without a real evaluation dataset (or on synthetic smoke-test data). "
-            f"Please return to **Model Ingestion** and provide a CSV/Parquet file, Hugging Face dataset ID, or upload a dataset."
-        )
+        st.info("Add an evaluation dataset to run attacks.")
+        col_ds_inline, col_ds_btn = st.columns([3, 1])
+        with col_ds_inline:
+            inline_ds_id = st.text_input(
+                "Evaluation Dataset Identifier or Path",
+                value="",
+                placeholder="e.g. bazyl/GTSRB or data/test.csv",
+                key="attack_page_dataset_input",
+            )
+        with col_ds_btn:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            if st.button("Load Dataset", key="attack_page_load_ds_btn", use_container_width=True):
+                if inline_ds_id.strip():
+                    try:
+                        updated_data = load_model_and_dataset(
+                            model_identifier=active_data.get("model_identifier"),
+                            dataset_name=inline_ds_id.strip(),
+                            data_domain=active_data.get("domain"),
+                            framework=(active_data.get("metadata").framework if active_data.get("metadata") else None),
+                            device=active_data.get("device", "cpu"),
+                            sample_size=active_data.get("sample_size", 5) or 5,
+                            allow_synthetic_fallback=False,
+                        )
+                        set_active_assessment(updated_data)
+                        st.rerun()
+                    except Exception as ds_err:
+                        st.error(f"Could not load dataset: {ds_err}")
 
     model_adapter = active_data["adapter"]
     domain = active_data.get("domain", "image")

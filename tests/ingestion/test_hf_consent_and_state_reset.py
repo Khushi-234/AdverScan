@@ -49,6 +49,7 @@ def test_joblib_security_consent_blocked_by_default_and_allowed_with_consent(tmp
         framework="sklearn",
         sample_size=4,
         unsafe_allow_pickle=True,
+        allow_synthetic_fallback=True,
     )
     assert res["model_identifier"] == str(model_path)
     assert res["adapter"] is not None

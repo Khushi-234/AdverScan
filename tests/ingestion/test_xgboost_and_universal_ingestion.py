@@ -240,7 +240,8 @@ def test_models_that_load_but_lack_evaluation_dataset():
             model_identifier="test/no-dataset-model",
             dataset_name=None,
             data_domain="tabular",
-            sample_size=4
+            sample_size=4,
+            allow_synthetic_fallback=True,
         )
 
         assert res["adapter"] is not None

@@ -120,6 +120,7 @@ def inspect_model_summary(model_identifier: str) -> Dict[str, Any]:
                         for w in (hf_info.get("weight_files") or ([fmt] if fmt != "unknown" else []))
                     )
                 ),
+                "requires_remote_code": bool(hf_info.get("requires_remote_code", False)),
                 "features_count": feats or (raw_feats if raw_feats > 0 else None),
                 "num_classes": None,
                 "artifacts": arts or hf_info.get("files", [])[:5],
@@ -353,6 +354,24 @@ def get_dataset_population_info(
     }
 
 
+def format_rejection_guidance(err: Exception) -> Dict[str, str]:
+    """Return plain-language message and actionable next step for typed R1..R6 rejections."""
+    reason = getattr(err, "rejection_reason", None)
+    msg = str(err)
+    guidance = {
+        "R1": ("Repository not found, private, or gated.", "Verify the Hugging Face model ID or supply a valid HF_TOKEN with access permissions."),
+        "R2": ("No runnable model artifact found in repository.", "Select a model repository containing serialized weights rather than a dataset-only or source-only repo."),
+        "R3": ("Model architecture or custom code consent required.", "Provide the model architecture/class or explicitly grant consent to execute remote custom code."),
+        "R4": ("Unsafe pickle/joblib deserialization blocked.", "Verify the artifact source and explicitly grant pickle deserialization consent to retry."),
+        "R5": ("Unsupported task (forecasting, regression, or generation).", "AdverScan supports classification models only in image, text, tabular, and time-series domains."),
+        "R6": ("Required runtime dependency is missing.", "Install the missing package shown in the error message and retry ingestion."),
+    }
+    if reason in guidance:
+        summary, next_step = guidance[reason]
+        return {"reason": reason, "summary": summary, "next_step": next_step, "detail": msg}
+    return {"reason": reason or "OTHER", "summary": "Model ingestion failed.", "next_step": "Check the model identifier, repository access, or backend ingestion logs.", "detail": msg}
+
+
 def load_model_and_dataset(
     model_identifier: Any,
     dataset_name: Optional[str] = None,
@@ -361,6 +380,7 @@ def load_model_and_dataset(
     device: Optional[str] = None,
     sample_size: int = 10,
     unsafe_allow_pickle: bool = False,
+    trust_remote_code: bool = False,
     force_refresh: bool = True,
     dataset_data: Optional[Any] = None,
     allow_synthetic_fallback: Optional[bool] = None,
@@ -414,6 +434,7 @@ def load_model_and_dataset(
             framework=exec_framework,
             device=exec_device,
             unsafe_allow_pickle=bool(unsafe_allow_pickle),
+            trust_remote_code=bool(trust_remote_code),
         )
     except (
         ModelLoadError,
@@ -578,9 +599,9 @@ def load_model_and_dataset(
 
     loader = None
     try:
-        if dataset_data is not None or resolved_dataset is not None or resolved_domain in ("tabular", "csv", "table"):
+        if dataset_data is not None or resolved_dataset is not None:
             loader = get_dataset_loader(
-                dataset_name=resolved_dataset or "custom_tabular",
+                dataset_name=resolved_dataset,
                 data_domain=resolved_domain,
                 processor_name=metadata.processor_name or clean_id,
                 split=f"test[:{sample_size}]",
@@ -611,30 +632,32 @@ def load_model_and_dataset(
         else:
             fallback_reason = (
                 f"No evaluation dataset is associated with model '{clean_id}'. "
-                f"Please select or upload a compatible evaluation dataset."
+                f"Model is accepted; provide an evaluation dataset when ready to run empirical attacks."
             )
     except Exception as exc:
+        # C2: Dataset failure must NEVER fail model acceptance. Keep model accepted with DATASET_PENDING.
         fallback_reason = str(exc)
-        # Case D: If user explicitly provided a dataset/file and it is incompatible or missing, fail cleanly (no synthetic fallback)
-        if explicit_dataset_requested and allow_synthetic_fallback is False:
-            if isinstance(exc, (DatasetFormatError, ValueError, ConfigurationError)):
-                raise DatasetFormatError(f"Dataset validation failed: {exc}") from exc
-            raise DatasetFormatError(f"Could not load specified dataset '{resolved_dataset}': {exc}") from exc
+        dataset_resolved = False
+        test_inputs = None
+        test_labels = None
 
     if not dataset_resolved:
-        if allow_synthetic_fallback is False:
-            # Case B: Keep model ingestion successful; do NOT silently generate synthetic evaluation data
-            test_inputs = None
-            test_labels = None
-            is_synthetic_dataset = False
-        else:
-            # Explicit synthetic fallback (Case E) or legacy caller compatibility
+        if allow_synthetic_fallback is True:
             if not fallback_reason:
                 fallback_reason = "No real evaluation dataset resolved"
             test_inputs, test_labels = _generate_domain_sample_batch(
                 metadata, sample_size, raw_model=raw_model, preset_info=preset_info
             )
             is_synthetic_dataset = True
+        else:
+            test_inputs = None
+            test_labels = None
+            is_synthetic_dataset = False
+
+    dataset_status = (
+        "SYNTHETIC_OPT_IN" if is_synthetic_dataset
+        else ("DATASET_READY" if dataset_resolved else "DATASET_PENDING")
+    )
 
     actual_evaluated_samples = (
         _get_input_sample_count(test_inputs, default=sample_size)
@@ -767,6 +790,21 @@ def load_model_and_dataset(
         "Gradient Access": gradient_access,
     }
 
+    acceptance_level = getattr(ingestion_res, "acceptance_level", "ACCEPTED_FULL")
+    rejection_reason = getattr(ingestion_res, "rejection_reason", None)
+    attempts = getattr(ingestion_res, "attempts", [])
+    warnings_list = getattr(ingestion_res, "warnings", [])
+    synthetic_smoke = bool((getattr(metadata, "extra_info", {}) or {}).get("synthetic_smoke", False))
+    caps_obj = getattr(adapter, "capabilities", None)
+    capabilities_dict = {
+        "supports_gradients": bool(getattr(caps_obj, "supports_gradients", False)),
+        "supports_predict": bool(getattr(caps_obj, "supports_predict", True)),
+        "supports_predict_proba": bool(
+            hasattr(raw_model, "predict_proba") or getattr(caps_obj, "supports_logits", False)
+        ),
+        "is_reconstructed": bool(getattr(adapter, "is_reconstructed", False)),
+    }
+
     return {
         "model_identifier": clean_id,
         "adapter": adapter,
@@ -775,6 +813,13 @@ def load_model_and_dataset(
         "metadata": metadata,
         "metadata_dict": metadata_dict,
         "telemetry": telemetry,
+        "acceptance_level": acceptance_level,
+        "rejection_reason": rejection_reason,
+        "attempts": attempts,
+        "warnings": warnings_list,
+        "synthetic_smoke": synthetic_smoke,
+        "capabilities": capabilities_dict,
+        "dataset_status": dataset_status,
         "is_synthetic_dataset": is_synthetic_dataset,
         "dataset_resolved": dataset_resolved,
         "dataset_source": (
@@ -851,11 +896,37 @@ def _generate_domain_sample_batch(
 ) -> Tuple[Any, Any]:
     """Generate a sample input tensor conforming to the model's expected shape and domain."""
     domain = str(getattr(metadata, "data_domain", "image")).lower().replace("_", "-")
-    num_classes = getattr(metadata, "num_classes", 2) or 2
+    num_classes = getattr(metadata, "num_classes", None)
+    if num_classes is None and raw_model is not None:
+        if hasattr(raw_model, "classes_") and getattr(raw_model, "classes_", None) is not None:
+            num_classes = len(raw_model.classes_)
+        elif hasattr(raw_model, "num_classes") and getattr(raw_model, "num_classes", None) is not None:
+            num_classes = getattr(raw_model, "num_classes")
+        elif hasattr(raw_model, "config"):
+            num_classes = getattr(raw_model.config, "num_labels", None)
+    if num_classes is None and preset_info:
+        num_classes = preset_info.get("num_classes")
 
     if domain in ("image", "vision"):
-        inputs = torch.rand(sample_size, 3, 224, 224)
-        labels = torch.randint(0, num_classes, (sample_size,))
+        cfg = getattr(raw_model, "config", None) if raw_model is not None else None
+        in_shape = (
+            getattr(metadata, "input_shape", None)
+            or (getattr(raw_model, "input_shape", None) if raw_model is not None else None)
+            or (preset_info.get("input_resolution") if preset_info else None)
+        )
+        if not in_shape and cfg is not None:
+            img_sz = getattr(cfg, "image_size", None)
+            n_ch = getattr(cfg, "num_channels", None)
+            if isinstance(img_sz, int) and n_ch is not None:
+                in_shape = (int(n_ch), img_sz, img_sz)
+        if not in_shape or len(in_shape) < 3 or num_classes is None or num_classes <= 0:
+            raise ConfigurationError(
+                f"Cannot generate synthetic image samples for '{getattr(metadata, 'model_id', 'unknown')}': "
+                f"discovered input_shape={in_shape}, num_classes={num_classes}."
+            )
+        dims = tuple(int(d) for d in in_shape[-3:])
+        inputs = torch.rand(sample_size, *dims)
+        labels = torch.randint(0, int(num_classes), (sample_size,))
     elif domain in ("tabular", "csv"):
         # Discover num_features dynamically
         num_features = None
@@ -903,7 +974,10 @@ def _generate_domain_sample_batch(
 
         num_features = int(num_features)
         if num_classes is None or num_classes <= 0:
-            num_classes = 2
+            raise ConfigurationError(
+                f"Cannot generate synthetic tabular samples for '{getattr(metadata, 'model_id', 'unknown')}': "
+                f"missing 'num_classes'."
+            )
         inputs = torch.randn(sample_size, num_features)
         labels = torch.randint(0, num_classes, (sample_size,))
     elif domain in ("time-series", "timeseries", "sequence"):
@@ -959,16 +1033,28 @@ def _generate_domain_sample_batch(
         inputs = torch.randn(sample_size, seq_len, num_channels)
         labels = torch.randint(0, num_classes, (sample_size,))
     elif domain in ("text", "nlp"):
-        # Generate tokenized text representation for text models
+        # Generate tokenized text representation for text models using discovered config dimensions only
         cfg = getattr(raw_model, "config", None) if raw_model is not None else None
-        seq_len = getattr(cfg, "max_position_embeddings", None) or getattr(metadata, "max_length", 32) or 32
-        seq_len = min(int(seq_len), 128)
+        seq_len = getattr(cfg, "max_position_embeddings", None) or getattr(metadata, "max_length", None)
+        if seq_len is None or num_classes is None or num_classes <= 0:
+            raise ConfigurationError(
+                f"Cannot generate synthetic text samples for '{getattr(metadata, 'model_id', 'unknown')}': "
+                f"discovered seq_len={seq_len}, num_classes={num_classes}."
+            )
+        seq_len = int(seq_len)
         input_ids = torch.randint(100, 2000, (sample_size, seq_len))
         attention_mask = torch.ones((sample_size, seq_len), dtype=torch.long)
         inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
         labels = torch.randint(0, num_classes, (sample_size,))
     else:
-        inputs = torch.rand(sample_size, 3, 224, 224)
+        in_shape = getattr(metadata, "input_shape", None) or (preset_info.get("input_resolution") if preset_info else None)
+        if not in_shape or len(in_shape) < 3 or num_classes is None or num_classes <= 0:
+            raise ConfigurationError(
+                f"Cannot generate synthetic image samples for '{getattr(metadata, 'model_id', 'unknown')}': "
+                f"discovered input_shape={in_shape}, num_classes={num_classes}."
+            )
+        dims = tuple(int(d) for d in in_shape[-3:])
+        inputs = torch.rand(sample_size, *dims)
         labels = torch.randint(0, num_classes, (sample_size,))
 
     return inputs, labels

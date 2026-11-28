@@ -213,24 +213,61 @@ def detect_hf_repo_info(repo_id: str, force_refresh: bool = False) -> Dict[str, 
         "model_file": None,
         "is_model_repo": False,
         "repo_type": "unknown",
+        "rejection_reason": None,
         "error": None,
     }
 
     try:
         from huggingface_hub import HfApi, hf_hub_download
+        try:
+            from huggingface_hub.errors import (
+                GatedRepoError,
+                HfHubHTTPError,
+                RepositoryNotFoundError,
+            )
+        except Exception:
+            GatedRepoError = RepositoryNotFoundError = HfHubHTTPError = Exception  # type: ignore
+
         api = HfApi()
 
-        # 1. Fetch file list
+        # 1. Fetch file list (with one unauthenticated retry on 401)
         files: List[str] = []
         try:
             files = api.list_repo_files(clean_id)
             res["files"] = files
         except Exception as exc:
-            res["error"] = str(exc)
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
             err_lower = str(exc).lower()
-            if "404" in err_lower or "401" in err_lower or "not found" in err_lower:
-                res["repo_type"] = "not_found"
-            files = []
+            is_401 = status_code == 401 or "401" in err_lower
+            if is_401:
+                try:
+                    no_tok_api = HfApi(token=False)
+                    files = no_tok_api.list_repo_files(clean_id, token=False)
+                    res["files"] = files
+                    api = no_tok_api
+                    exc = None
+                except Exception as retry_exc:
+                    exc = retry_exc
+                    status_code = getattr(getattr(retry_exc, "response", None), "status_code", None)
+                    err_lower = str(retry_exc).lower()
+
+            if exc is not None:
+                res["error"] = str(exc)
+                if isinstance(exc, GatedRepoError) or status_code == 403 or "gated" in err_lower or "403" in err_lower:
+                    res["repo_type"] = "private_or_gated"
+                    res["rejection_reason"] = "R1"
+                elif (
+                    isinstance(exc, RepositoryNotFoundError)
+                    or status_code in (401, 404)
+                    or "404" in err_lower
+                    or "401" in err_lower
+                    or "not found" in err_lower
+                ):
+                    res["repo_type"] = "not_found"
+                    res["rejection_reason"] = "R1"
+                else:
+                    res["repo_type"] = "error"
+                return res
 
         # 2. Fetch model metadata / card data
         tags: List[str] = []
@@ -318,6 +355,7 @@ def detect_hf_repo_info(repo_id: str, force_refresh: bool = False) -> Dict[str, 
         res["raw_feature_names"] = insp.raw_feature_names
         res["num_features"] = insp.num_features
         res["architecture"] = insp.architecture
+        res["requires_remote_code"] = bool(isinstance(cfg_data, dict) and cfg_data.get("auto_map"))
         if res["framework"] == "sklearn":
             res["domain"] = "tabular"
 

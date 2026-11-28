@@ -30,12 +30,42 @@ class KerasAdapter(BaseModelAdapter):
         self._device = str(device)
         self.processor = processor
         self.data_domain = data_domain
+        self._supports_gradients: Optional[bool] = None
+
+    def _probe_supports_gradients(self) -> bool:
+        """Probe whether tf.GradientTape can compute input gradients through this model."""
+        if self._supports_gradients is not None:
+            return self._supports_gradients
+        try:
+            import tensorflow as tf
+            if "TFSMLayer" in type(self._model).__name__:
+                self._supports_gradients = False
+                return False
+
+            in_shape = getattr(self._model, "input_shape", None) or getattr(self._model, "_savedmodel_input_shape", None)
+            if isinstance(in_shape, list) and in_shape:
+                in_shape = in_shape[0]
+            if isinstance(in_shape, (tuple, list)) and len(in_shape) >= 2:
+                dims = [1 if d is None else int(d) for d in in_shape]
+            else:
+                dims = [1, 4]
+            x_probe = tf.Variable(tf.zeros(dims, dtype=tf.float32))
+            with tf.GradientTape() as tape:
+                y = self._model(x_probe, training=False)
+                if isinstance(y, dict):
+                    y = next(iter(y.values()))
+                loss = tf.reduce_sum(tf.cast(y, tf.float32))
+            grad = tape.gradient(loss, x_probe)
+            self._supports_gradients = grad is not None
+        except Exception:
+            self._supports_gradients = False
+        return self._supports_gradients
 
     @property
     def capabilities(self) -> AdapterCapabilities:
-        """TF/Keras models do not expose PyTorch autograd gradients directly."""
+        """Determine gradient capability via real tf.GradientTape probe."""
         return AdapterCapabilities(
-            supports_gradients=False,
+            supports_gradients=self._probe_supports_gradients(),
             supports_predict=True,
             supports_batch_predict=True,
             supports_logits=True,

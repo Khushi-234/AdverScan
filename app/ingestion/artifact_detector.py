@@ -8,9 +8,32 @@ calibration, and metadata artifacts across local files and Hugging Face reposito
 from __future__ import annotations
 
 import json
+import logging
+import pickletools
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RankedCandidate:
+    """A ranked (loader, artifact) candidate with confidence score and evidence."""
+    loader: str
+    artifact: Optional[str]
+    confidence: float
+    evidence: List[str] = field(default_factory=list)
+    framework: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "loader": self.loader,
+            "artifact": self.artifact,
+            "confidence": self.confidence,
+            "evidence": list(self.evidence),
+            "framework": self.framework,
+        }
 
 
 @dataclass
@@ -361,4 +384,147 @@ class ModelArtifactDetector:
 
         result.repo_type = "model" if result.is_model_repo else result.repo_type
         return result
+
+    @staticmethod
+    def _inspect_file_magic(file_path: Path) -> Optional[str]:
+        """Inspect file magic bytes without executing deserialization."""
+        try:
+            with open(file_path, "rb") as f:
+                head = f.read(64)
+            if head.startswith(b"PK\x03\x04"):
+                return "zip_keras"
+            if head.startswith(b"\x89HDF\r\n\x1a\n"):
+                return "hdf5_h5"
+            stripped = head.lstrip()
+            if stripped.startswith(b"{"):
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as tf:
+                    snippet = tf.read(4096)
+                if '"learner"' in snippet:
+                    return "xgboost_json"
+        except Exception as exc:
+            logger.debug("Magic byte inspection failed for %s: %s", file_path, exc)
+        return None
+
+    @staticmethod
+    def _scan_pickle_opcodes(file_path: Path, max_bytes: int = 262144) -> List[str]:
+        """Scan pickle/joblib opcodes via pickletools WITHOUT executing any code (bounded read)."""
+        modules: List[str] = []
+        try:
+            with open(file_path, "rb") as f:
+                raw = f.read(max_bytes)
+            data = raw
+            if raw.startswith(b"\x1f\x8b"):
+                import gzip
+                with gzip.GzipFile(fileobj=__import__("io").BytesIO(raw)) as gz:
+                    data = gz.read(max_bytes)
+            elif raw.startswith(b"BZh"):
+                import bz2
+                data = bz2.BZ2Decompressor().decompress(raw, max_length=max_bytes)
+            elif raw.startswith(b"\xfd7zXZ"):
+                import lzma
+                data = lzma.LZMADecompressor().decompress(raw, max_length=max_bytes)
+            elif len(raw) >= 2 and raw[0] == 0x78 and raw[1] in (0x01, 0x5E, 0x9C, 0xDA):
+                import zlib
+                data = zlib.decompressobj().decompress(raw, max_bytes)
+
+            str_stack: List[str] = []
+            for opcode, arg, _pos in pickletools.genops(data):
+                if opcode.name in ("SHORT_BINUNICODE", "BINUNICODE", "UNICODE") and isinstance(arg, str):
+                    str_stack.append(arg)
+                    if len(str_stack) > 4:
+                        str_stack.pop(0)
+                elif opcode.name == "GLOBAL" and isinstance(arg, str):
+                    mod = arg.split()[0].split(".")[0].lower()
+                    if mod and mod not in modules:
+                        modules.append(mod)
+                elif opcode.name == "STACK_GLOBAL" and len(str_stack) >= 2:
+                    mod = str_stack[-2].split(".")[0].lower()
+                    if mod and mod not in modules:
+                        modules.append(mod)
+        except Exception as exc:
+            logger.debug("Pickle opcode scan skipped for %s: %s", file_path, exc)
+        return modules
+
+    @staticmethod
+    def _classify_config_json(cfg_dict: Optional[Dict[str, Any]]) -> str:
+        """Classify config.json ecosystem: transformers, skops, autotrain, or unknown."""
+        if not isinstance(cfg_dict, dict) or not cfg_dict:
+            return "unknown"
+        if "sklearn" in cfg_dict:
+            return "skops"
+        if isinstance(cfg_dict.get("features"), list):
+            return "autotrain"
+        if cfg_dict.get("model_type") or cfg_dict.get("architectures"):
+            return "transformers"
+        return "unknown"
+
+    @classmethod
+    def rank_candidates(
+        cls,
+        files: List[str],
+        local_dir: Optional[Path] = None,
+        config_dict: Optional[Dict[str, Any]] = None,
+        hf_info: Optional[Dict[str, Any]] = None,
+    ) -> List[RankedCandidate]:
+        """
+        Build a ranked list of (loader, artifact, confidence, evidence) candidates
+        using file manifest, config.json kind, magic bytes, and pickletools opcode scan.
+        """
+        candidates: List[RankedCandidate] = []
+        cfg_kind = cls._classify_config_json(config_dict)
+        lib_name = str((hf_info or {}).get("library_name") or "").lower()
+
+        for fname in files:
+            low = fname.lower()
+            magic = None
+            pickle_mods: List[str] = []
+            if local_dir is not None and (local_dir / fname).is_file():
+                fpath = local_dir / fname
+                magic = cls._inspect_file_magic(fpath)
+                if low.endswith((".pkl", ".pickle", ".joblib")):
+                    pickle_mods = cls._scan_pickle_opcodes(fpath)
+
+            if low.endswith((".json", ".ubj", ".model")) and (
+                magic == "xgboost_json" or "xgboost" in low or "xgb" in low
+            ):
+                candidates.append(RankedCandidate("tree", fname, 0.96, [f"XGBoost artifact {fname}"], "xgboost"))
+            elif low.endswith(".cbm"):
+                candidates.append(RankedCandidate("tree", fname, 0.96, [f"CatBoost artifact {fname}"], "catboost"))
+            elif low.endswith(".onnx"):
+                candidates.append(RankedCandidate("onnx", fname, 0.95, [f"ONNX artifact {fname}"], "onnx"))
+            elif low.endswith((".keras", ".h5", ".hdf5")) or low == "saved_model.pb" or magic in ("zip_keras", "hdf5_h5"):
+                candidates.append(RankedCandidate("keras", fname, 0.93, [f"Keras/TF artifact {fname}"], "keras"))
+            elif low.endswith((".joblib", ".pkl", ".pickle")):
+                ev = [f"Serialized tabular artifact {fname}"]
+                if cfg_kind == "autotrain":
+                    ev.append("AutoTrain config.json (features list)")
+                if pickle_mods:
+                    ev.append(f"pickletools modules: {pickle_mods[:5]}")
+                if "xgboost" in pickle_mods or "xgboost" in lib_name or "xgb" in low:
+                    candidates.append(RankedCandidate("tree", fname, 0.92, ev, "xgboost"))
+                    candidates.append(RankedCandidate("sklearn", fname, 0.85, ev, "sklearn"))
+                elif "lightgbm" in pickle_mods:
+                    candidates.append(RankedCandidate("tree", fname, 0.92, ev, "lightgbm"))
+                    candidates.append(RankedCandidate("sklearn", fname, 0.85, ev, "sklearn"))
+                else:
+                    conf = 0.94 if (cfg_kind in ("autotrain", "skops") or "sklearn" in pickle_mods) else 0.88
+                    candidates.append(RankedCandidate("sklearn", fname, conf, ev, "sklearn"))
+                    candidates.append(RankedCandidate("tree", fname, 0.60, ev, "xgboost"))
+            elif low.endswith((".safetensors", ".pt", ".pth", ".ckpt", ".bin")):
+                if cfg_kind == "transformers":
+                    candidates.append(RankedCandidate("huggingface", fname, 0.95, [f"Transformers config + {fname}"], "huggingface"))
+                else:
+                    candidates.append(RankedCandidate("pytorch", fname, 0.85, [f"PyTorch weights {fname}"], "pytorch"))
+
+        if cfg_kind == "transformers" and not any(c.loader == "huggingface" for c in candidates):
+            candidates.append(RankedCandidate("huggingface", "config.json", 0.90, ["Transformers config.json"], "huggingface"))
+
+        # Deduplicate by (loader, artifact) keeping highest confidence
+        seen: Dict[Tuple[str, Optional[str]], RankedCandidate] = {}
+        for cand in candidates:
+            key = (cand.loader, cand.artifact)
+            if key not in seen or cand.confidence > seen[key].confidence:
+                seen[key] = cand
+
+        return sorted(seen.values(), key=lambda c: c.confidence, reverse=True)
 
